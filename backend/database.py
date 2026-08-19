@@ -139,7 +139,7 @@ def seed_super_admin() -> None:
         admin = models.Usuario(
             empresa_id=None,
             nome="Administrador",
-            email=SUPER_ADMIN_EMAIL,
+            email=SUPER_ADMIN_EMAIL.strip().lower(),
             senha_hash=hash_password(SUPER_ADMIN_PASSWORD),
             role=models.RoleUsuario.super_admin,
         )

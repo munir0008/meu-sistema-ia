@@ -51,6 +51,17 @@ ADMIN = models.RoleUsuario.admin
 USER = models.RoleUsuario.user
 
 
+def _normalizar_email(email: str) -> str:
+    """
+    E-mail não é case-sensitive (RFC 5321 trata o domínio como tal na prática,
+    e usuários digitam com capitalização inconsistente — autocapitalize de
+    celular, copiar/colar, etc.). Normaliza para minúsculas + sem espaços nas
+    pontas antes de qualquer busca/gravação, para "Nome@Empresa.com" e
+    "nome@empresa.com" serem sempre a mesma conta.
+    """
+    return email.strip().lower()
+
+
 # ==============================================================================
 # AUTENTICAÇÃO
 # ==============================================================================
@@ -68,7 +79,8 @@ def _token_response(usuario: models.Usuario) -> schemas.Token:
 
 @router.post("/api/auth/login", response_model=schemas.Token, tags=["auth"])
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
-    usuario = db.query(models.Usuario).filter(models.Usuario.email == payload.email).first()
+    email = _normalizar_email(payload.email)
+    usuario = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     if not usuario or not verify_password(payload.senha, usuario.senha_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Email ou senha inválidos"
@@ -91,7 +103,8 @@ def signup(payload: schemas.SignupRequest, db: Session = Depends(get_db)):
     from config import TRIAL_DIAS
     from datetime import timedelta
 
-    existente = db.query(models.Usuario).filter(models.Usuario.email == payload.email).first()
+    email = _normalizar_email(payload.email)
+    existente = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     if existente:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email já cadastrado")
 
@@ -106,7 +119,7 @@ def signup(payload: schemas.SignupRequest, db: Session = Depends(get_db)):
     usuario = models.Usuario(
         empresa_id=empresa.id,
         nome=payload.nome_admin,
-        email=payload.email,
+        email=email,
         senha_hash=hash_password(payload.senha),
         role=ADMIN,
     )
@@ -240,14 +253,15 @@ def criar_usuario_super_admin(
     db: Session = Depends(get_db),
     _: models.Usuario = Depends(require_roles(SUPER_ADMIN)),
 ):
-    existente = db.query(models.Usuario).filter(models.Usuario.email == payload.email).first()
+    email = _normalizar_email(payload.email)
+    existente = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     if existente:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email já cadastrado")
 
     usuario = models.Usuario(
         empresa_id=None,
         nome=payload.nome,
-        email=payload.email,
+        email=email,
         senha_hash=hash_password(payload.senha),
         role=SUPER_ADMIN,
     )
@@ -275,7 +289,7 @@ def atualizar_usuario_super_admin(
     if payload.nome is not None:
         usuario.nome = payload.nome
     if payload.email is not None:
-        usuario.email = payload.email
+        usuario.email = _normalizar_email(payload.email)
     if payload.senha is not None:
         usuario.senha_hash = hash_password(payload.senha)
 
@@ -333,14 +347,15 @@ def criar_membro_equipe(
     db: Session = Depends(get_db),
     atual: models.Usuario = Depends(require_roles(ADMIN)),
 ):
-    existente = db.query(models.Usuario).filter(models.Usuario.email == payload.email).first()
+    email = _normalizar_email(payload.email)
+    existente = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     if existente:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email já cadastrado")
 
     membro = models.Usuario(
         empresa_id=atual.empresa_id,
         nome=payload.nome,
-        email=payload.email,
+        email=email,
         senha_hash=hash_password(payload.senha),
         role=USER,
     )
