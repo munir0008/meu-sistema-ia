@@ -9,7 +9,7 @@ export const PLANOS = [
   {
     chave: PLANO_UNICO_CHAVE,
     nome: "Plano Completo",
-    preco: "R$ 0,10",
+    preco: "R$ 0,05",
     periodo: "/mês",
     descricao: "Tudo que sua operação precisa, em um único plano simples.",
     recursos: [

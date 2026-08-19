@@ -88,7 +88,7 @@ Se for usar um domínio (ex.: `app.suaempresa.com`):
 
 1. No [Dashboard da Stripe](https://dashboard.stripe.com), **saia do modo Teste** (toggle no canto — vá para **Live**).
 2. **Developers → API keys**: copie `pk_live_...` e `sk_live_...`.
-3. **Product catalog → Add product**: crie **"Plano Completo"**, preço recorrente, mensal, **R$ 0,10**, moeda BRL. Copie o `price_...` gerado.
+3. **Product catalog → Add product**: crie **"Plano Completo"**, preço recorrente, mensal, **R$ 0,05**, moeda BRL. Copie o `price_...` gerado.
 4. **Developers → Webhooks → Add endpoint**:
    - URL: `https://SEU-BACKEND-NO-RENDER/api/webhooks/stripe`
    - Eventos: `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`
