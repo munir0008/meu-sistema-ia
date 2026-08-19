@@ -1,0 +1,37 @@
+# --- Segredos / configuração local (NUNCA versionar) ---
+.env
+.env.local
+backend/.env
+frontend/.env
+.claude/settings.local.json
+
+# --- Backend (Python) ---
+backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+backend/*.db
+backend/*.db-journal
+backend/*.pt
+backend/*.pid
+backend/*.log
+
+# --- Frontend (Node/Vite) ---
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.log
+
+# --- Runtime local (run_app.py / start.sh / start.bat) ---
+*.pid
+run_app.log
+run_app.pid
+backend.pid
+frontend.pid
+
+# --- Sistema operacional / editor ---
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
