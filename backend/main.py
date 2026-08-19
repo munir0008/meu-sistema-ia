@@ -21,9 +21,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Origens sempre liberadas, além do que `CORS_ORIGINS`/`FRONTEND_URL` definir via
+# variável de ambiente — rede de segurança para o frontend oficial em produção
+# nunca ficar bloqueado por um valor de env var ausente/errado na plataforma de
+# deploy (foi exatamente o que aconteceu ao publicar: `FRONTEND_URL` configurada
+# certinha no Render, mas a origem seguia sendo recusada). Adicione aqui outros
+# domínios fixos (ex.: domínio próprio) se/quando existirem.
+ORIGENS_SEMPRE_PERMITIDAS = ["https://meu-sistema-ia.vercel.app"]
+
+_origens_permitidas = sorted(set(CORS_ORIGINS) | set(ORIGENS_SEMPRE_PERMITIDAS))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=_origens_permitidas,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,6 +49,7 @@ def on_startup() -> None:
     init_db()
     seed_super_admin()
     print(f"[stripe] Configure o webhook da assinatura para: {BACKEND_URL}/api/webhooks/stripe")
+    print(f"[cors] Origens permitidas: {_origens_permitidas}")
 
 
 @app.on_event("shutdown")
