@@ -1,6 +1,15 @@
 import axios from "axios";
 
-export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// Fallback de produção como rede de segurança: se a env var VITE_API_URL não
+// estiver definida no projeto da Vercel (ou vier vazia), cair em
+// "http://localhost:8000" faz o navegador do usuário tentar falar com o
+// localhost DELE, não com o backend — erro de rede, não de CORS, mas que
+// aparece pro usuário como o mesmo "Não foi possível entrar" genérico. Em
+// dev local, defina VITE_API_URL=http://localhost:8000 no seu ".env" (ver
+// ".env.example") para não cair nesse fallback de produção sem querer.
+const API_URL_FALLBACK_PRODUCAO = "https://visionsaas-backend.onrender.com";
+
+export const API_URL = import.meta.env.VITE_API_URL || API_URL_FALLBACK_PRODUCAO;
 
 export const TOKEN_STORAGE_KEY = "vision_saas_token";
 // Nome da empresa não vem no JWT (não é usado para autorização) — guardado à parte
