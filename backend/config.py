@@ -6,6 +6,7 @@ padrão seguros o suficiente para desenvolvimento local. Em produção, defina
 SECRET_KEY e SUPER_ADMIN_PASSWORD via variáveis de ambiente reais.
 """
 import os
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -39,7 +40,31 @@ SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "admin123")
 # URL pública do frontend, usada para montar as URLs de retorno do Stripe Checkout
 # e do Customer Portal (success_url/cancel_url/return_url) e como origem permitida
 # de CORS por padrão (ver CORS_ORIGINS, abaixo).
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+#
+# A env var pode estar DEFINIDA porém com um valor inválido (ex.: colada de um
+# texto/Markdown como "[https://...](https://...)", ou com aspas/espaços
+# sobrando) — mesmo problema já visto com VITE_API_URL na Vercel (ver
+# frontend/src/api/client.js). Sem validar, isso vira uma URL quebrada
+# passada pro Stripe em `return_url`/`success_url`/`cancel_url`, que a API
+# rejeita com "Not a valid URL" — o Customer Portal e o Checkout nunca abrem.
+_FRONTEND_URL_FALLBACK_PRODUCAO = "https://meu-sistema-ia.vercel.app"
+
+
+def _resolver_frontend_url(bruto: str) -> str:
+    valor = (bruto or "").strip()
+    if not valor:
+        return "http://localhost:5173"
+    partes = urlparse(valor)
+    if partes.scheme in ("http", "https") and partes.netloc:
+        return valor.rstrip("/")
+    print(
+        f"[config] FRONTEND_URL inválida ({valor!r}) — usando fallback de produção "
+        f"({_FRONTEND_URL_FALLBACK_PRODUCAO}). Corrija a env var no dashboard do Render."
+    )
+    return _FRONTEND_URL_FALLBACK_PRODUCAO
+
+
+FRONTEND_URL = _resolver_frontend_url(os.getenv("FRONTEND_URL", "http://localhost:5173"))
 
 # URL pública do próprio backend (ex.: https://seu-app.onrender.com). Não é usada
 # para nenhuma regra de negócio — só para logar, no startup, o endpoint exato que

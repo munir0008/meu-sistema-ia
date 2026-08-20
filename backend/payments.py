@@ -134,13 +134,33 @@ def criar_portal_ou_checkout_session(
                 )
                 return session.url, None
             except stripe.error.InvalidRequestError as exc:
+                # IMPORTANTE: InvalidRequestError é levantado pra QUALQUER parâmetro
+                # ruim (customer inexistente, mas também return_url malformada,
+                # etc.) — só trata como "customer inválido" quando o erro é
+                # especificamente sobre o parâmetro `customer` (code
+                # "resource_missing", ex.: "No such customer: 'cus_xxx'").
+                # Tratar todo InvalidRequestError como customer inválido já causou
+                # um bug real: um erro de URL quebrada (FRONTEND_URL corrompida)
+                # fazia zerar o stripe_customer_id válido e criar um Customer
+                # duplicado na Stripe antes de falhar de novo no checkout.
+                codigo = getattr(exc, "code", None)
+                param = getattr(exc, "param", None) or ""
+                customer_invalido = codigo == "resource_missing" and "customer" in param
+                if not customer_invalido:
+                    logger.exception(
+                        "customer-portal: InvalidRequestError NÃO relacionado ao customer "
+                        "para empresa_id=%s (http_status=%s code=%s param=%s) — não é seguro "
+                        "tratar como customer inválido, propagando sem fallback",
+                        empresa.id, getattr(exc, "http_status", None), codigo, param,
+                    )
+                    raise
                 # customer_id salvo não existe mais nessa conta/ambiente Stripe —
                 # trata como se a empresa nunca tivesse um customer.
                 logger.warning(
                     "customer-portal: stripe_customer_id=%s inválido para empresa_id=%s "
                     "(http_status=%s code=%s): %s — caindo para checkout de 1º pagamento",
                     empresa.stripe_customer_id, empresa.id,
-                    getattr(exc, "http_status", None), getattr(exc, "code", None),
+                    getattr(exc, "http_status", None), codigo,
                     exc.user_message or str(exc),
                 )
                 empresa.stripe_customer_id = None
