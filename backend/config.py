@@ -92,7 +92,18 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", "VisionSaaS <onboarding@resend.dev>")
 # --- Visão computacional ---
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
 YOLO_CONF_THRESHOLD = float(os.getenv("YOLO_CONF_THRESHOLD", "0.35"))
-YOLO_TRACKER = os.getenv("YOLO_TRACKER", "bytetrack.yaml")
+# Caminho absoluto (não depende do cwd de onde o backend foi iniciado) para o
+# tracker customizado deste projeto — ver trackers/bytetrack_custom.yaml: mesmo
+# ByteTrack do Ultralytics, só com `track_buffer` maior, para manter o mesmo
+# track_id numa oclusão breve (passar atrás de um pilar/outro atendente) em vez
+# de reatribuir um ID novo à mesma pessoa. Sobrescreva via env var para usar o
+# `bytetrack.yaml` padrão do pacote (ou outro tracker) se preferir.
+_TRACKER_PADRAO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trackers", "bytetrack_custom.yaml")
+# `os.getenv` só cai no default quando a env var não existe — se alguém deixar
+# `YOLO_TRACKER=` (vazio) no .env, o valor seria a string vazia, não o default
+# (mesma pegadinha já documentada para FRONTEND_URL, abaixo). `.strip() or` trata
+# vazio/só-espaços como "não configurado".
+YOLO_TRACKER = os.getenv("YOLO_TRACKER", "").strip() or _TRACKER_PADRAO
 
 STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "80"))
 STREAM_TARGET_FPS = int(os.getenv("STREAM_TARGET_FPS", "15"))
@@ -125,6 +136,31 @@ ESTOQUE_GRID_COLUNAS = int(os.getenv("ESTOQUE_GRID_COLUNAS", "8"))
 ESTOQUE_GRID_LINHAS = int(os.getenv("ESTOQUE_GRID_LINHAS", "6"))
 
 OCUPACAO_AMOSTRA_SEGUNDOS = float(os.getenv("OCUPACAO_AMOSTRA_SEGUNDOS", "30"))
+
+# Balcão/Loja: tempo mínimo que um cliente precisa permanecer na 'Zona Cliente' SEM
+# nunca ter havido um atendente presente na 'Zona Atendente' durante a estadia dele
+# para contar como "desistência" no Dashboard Analytics (Tópico 1 — Perda de Vendas).
+DESISTENCIA_MIN_SEGUNDOS = float(os.getenv("DESISTENCIA_MIN_SEGUNDOS", "180"))
+
+# Balcão/Loja: limiares do alerta "Pico de Fila Sem Atendente" — a 'Zona Cliente'
+# atinge PICO_FILA_MIN_PESSOAS (ou mais) pessoas simultâneas enquanto a 'Zona
+# Atendente' permanece vazia por PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS contínuos.
+PICO_FILA_MIN_PESSOAS = int(os.getenv("PICO_FILA_MIN_PESSOAS", "2"))
+PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS = float(os.getenv("PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS", "120"))
+
+# Balcão/Loja: por quantos segundos uma mudança bruta de presença numa zona
+# ('Atendente'/'Cliente') precisa se manter estável antes de ser confirmada como
+# entrada/saída de verdade (debounce/histerese) — filtra flicker de detecção
+# (oscilação de confiança na borda do polígono, oclusão de 1-2 frames) sem
+# atrasar demais os eventos de telemetria (ver vision.DebouncePresenca).
+ZONA_DEBOUNCE_SEGUNDOS = float(os.getenv("ZONA_DEBOUNCE_SEGUNDOS", "2.5"))
+
+# Por quantos segundos sem NENHUM frame lido da câmera (queda de conexão) o
+# estado de sessões/presença em memória de uma câmera é descartado ao invés de
+# mantido pendurado — evita que uma sessão de fila ou presença de atendente que
+# estava aberta durante a queda gere uma duração de horas quando a câmera
+# finalmente reconectar (ver vision.VideoProcessor._verificar_desconexao_prolongada).
+CAMERA_OFFLINE_RESET_SEGUNDOS = float(os.getenv("CAMERA_OFFLINE_RESET_SEGUNDOS", "60"))
 
 # --- CORS ---
 # Em produção, a origem confiável por padrão é o próprio FRONTEND_URL (evita

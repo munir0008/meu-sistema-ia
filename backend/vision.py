@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -160,12 +160,37 @@ class TrackMovimento:
 
 
 @dataclass
-class ParAtendimento:
-    """Um par (atendente presente, cliente sendo atendido) com cronômetro ativo."""
+class DebouncePresenca:
+    """
+    Debounce/histerese de presença de UMA pessoa (track_id) numa zona: só
+    confirma uma entrada/saída depois que o estado bruto observado (dentro/fora
+    do polígono) se mantém estável por ZONA_DEBOUNCE_SEGUNDOS — filtra flicker de
+    detecção (oscilação de confiança na borda do polígono, oclusão de 1-2
+    frames) sem atrasar demais os eventos de telemetria. Ver
+    VideoProcessor._atualizar_debounce.
+    """
 
-    atendente_track_id: int
-    inicio: float  # time.monotonic()
-    confirmado: bool = False  # True assim que a presença conjunta atinge o limiar
+    confirmado: bool = False  # último estado CONFIRMADO (dentro=True/fora=False)
+    candidato: bool = False  # estado bruto observado no frame atual
+    candidato_desde: float = 0.0  # time.monotonic() de quando `candidato` começou
+    confirmado_desde: Optional[float] = None  # time.monotonic() da última entrada confirmada (p/ medir duração na saída)
+
+
+@dataclass
+class SessaoFilaCliente:
+    """
+    Uma pessoa na zona 'Cliente', do momento em que entra até sair — usada para
+    calcular tempo de espera, desistência e "Atendimento Em Andamento" (Dashboard
+    Analytics Tópico 1). Ver vision.VideoProcessor._atualizar_atendimento_balcao.
+    """
+
+    inicio: float  # time.monotonic() da entrada na zona 'Cliente'
+    # time.monotonic() da primeira vez que um atendente foi visto presente na
+    # zona 'Atendente' enquanto esta sessão estava ativa. None = ainda não atendido.
+    momento_atendente_chegou: Optional[float] = None
+    # True assim que a presença conjunta (atendente + este cliente) atinge o limiar
+    # ATENDIMENTO_MIN_SEGUNDOS — "Atendimento Em Andamento".
+    confirmado: bool = False
 
 
 # ----------------------------------------------------------------------------
@@ -204,11 +229,26 @@ class VideoProcessor:
         # --- Estado de rastreamento (tocado só pela thread de processamento) ---
         self._tracks: Dict[int, TrackMovimento] = {}
 
-        # --- Perfil balcão/loja: atendimento por par atendente+cliente ---
-        self._pares_atendimento: Dict[int, ParAtendimento] = {}
+        # --- Perfil balcão/loja: debounce de presença por zona (ver DebouncePresenca) ---
+        self._debounce_atendente: Dict[int, DebouncePresenca] = {}
+        self._debounce_cliente: Dict[int, DebouncePresenca] = {}
+
+        # --- Perfil balcão/loja: sessões de fila (cliente na zona 'Cliente') ---
+        self._sessoes_fila: Dict[int, SessaoFilaCliente] = {}
         self._cooldown_clientes: Dict[int, float] = {}  # track_id -> quando saiu
 
+        # --- Perfil balcão/loja: alerta "Pico de Fila Sem Atendente" ---
+        self._fila_atendente_ausente_desde: Optional[float] = None
+        self._fila_pico_registrado = False
+
         agora = time.monotonic()
+        # --- Perfil balcão/loja: amostragem periódica de ocupação das zonas
+        # 'Atendente'/'Trabalho' e 'Cliente' (Dashboard Analytics Tópico 2) ---
+        self._ultima_amostra_balcao = agora
+
+        # --- Resiliência a queda de conexão da câmera (ver _verificar_desconexao_prolongada) ---
+        self._ultima_leitura_ok_em = agora
+        self._estado_resetado_por_desconexao = False
         # --- Perfil escritório: inatividade na zona de trabalho ---
         self._escritorio_ultima_atividade_em = agora
         self._escritorio_evento_registrado = False
@@ -367,36 +407,137 @@ class VideoProcessor:
         estado = self._tracks.get(track_id)
         return estado is not None and (agora - estado.ultima_vez_moveu) < janela_segundos
 
-    # -------------------- Perfil BALCÃO/LOJA: atendimento por par atendente+cliente --------------------
+    # -------------------- debounce genérico de presença por zona --------------------
+    def _atualizar_debounce(
+        self, estados: Dict[int, DebouncePresenca], tracks_no_raw: Set[int], agora: float
+    ) -> Tuple[Set[int], Set[int], Dict[int, float]]:
+        """
+        Atualiza o debounce de presença (ver DebouncePresenca) para todo track_id
+        visto neste frame OU com estado pendente, e devolve:
+          - confirmados_dentro: quem está CONFIRMADO dentro da zona agora (já
+            debounced — é isso que o resto da lógica de negócio deve usar, nunca
+            `tracks_no_raw` diretamente);
+          - entradas: track_ids cuja entrada acabou de ser confirmada neste frame;
+          - saidas: track_ids cuja saída acabou de ser confirmada neste frame, com
+            a duração (segundos) que passaram confirmados dentro da zona.
+        """
+        entradas: Set[int] = set()
+        saidas: Dict[int, float] = {}
+
+        for tid in set(estados.keys()) | tracks_no_raw:
+            raw = tid in tracks_no_raw
+            estado = estados.get(tid)
+            if estado is None:
+                estado = DebouncePresenca(candidato=raw, candidato_desde=agora)
+                estados[tid] = estado
+            elif estado.candidato != raw:
+                estado.candidato = raw
+                estado.candidato_desde = agora
+
+            if estado.confirmado != estado.candidato and (agora - estado.candidato_desde) >= config.ZONA_DEBOUNCE_SEGUNDOS:
+                estado.confirmado = estado.candidato
+                if estado.confirmado:
+                    estado.confirmado_desde = agora
+                    entradas.add(tid)
+                else:
+                    saidas[tid] = agora - estado.confirmado_desde if estado.confirmado_desde is not None else 0.0
+                    estado.confirmado_desde = None
+
+        # Limpeza: descarta quem está estável fora da zona (nada pendente a confirmar).
+        expirados = [
+            tid for tid, e in estados.items() if not e.confirmado and not e.candidato and tid not in tracks_no_raw
+        ]
+        for tid in expirados:
+            del estados[tid]
+
+        confirmados_dentro = {tid for tid, e in estados.items() if e.confirmado}
+        return confirmados_dentro, entradas, saidas
+
+    def _registrar_evento_zona(
+        self,
+        tipo_evento: "models.TipoEventoZona",
+        track_id: Optional[int] = None,
+        duracao_segundos: Optional[float] = None,
+    ) -> None:
+        db = self.session_factory()
+        try:
+            registro = models.EventoZona(
+                camera_id=self.camera_id,
+                empresa_id=self.empresa_id,
+                timestamp=datetime.utcnow(),
+                tipo_evento=tipo_evento,
+                track_id=track_id,
+                duracao_segundos=round(duracao_segundos, 2) if duracao_segundos is not None else None,
+            )
+            db.add(registro)
+            db.commit()
+        finally:
+            db.close()
+
+    # -------------------- Perfil BALCÃO/LOJA: sessões de fila (cliente x atendente) --------------------
     def _atualizar_atendimento_balcao(
         self, centros: Dict[int, Centro], w: int, h: int, agora: float
     ) -> None:
         """
-        Algoritmo (spec):
-        1. Monitora 'Zona do Atendente' e 'Zona do Cliente' simultaneamente.
-        2. Quando há pelo menos um ID em cada zona AO MESMO TEMPO, inicia um
-           cronômetro para aquele cliente (associado ao atendente presente no momento).
-        3. Se a presença conjunta permanece contínua por >= ATENDIMENTO_MIN_SEGUNDOS,
-           o par é confirmado como "Atendimento Em Andamento" (sinalizado no overlay).
-        4. Quando o cliente sai da zona, o cronômetro é encerrado: grava-se +1
-           atendimento com a duração exata; concluído=True somente se chegou a ser
-           confirmado (>= limiar), senão é registrado como abandono/passagem rápida.
-        5. Anti-duplicação: ao encerrar, o track_id do cliente entra em cooldown por
-           CLIENTE_COOLDOWN_SEGUNDOS — se reaparecer na zona nesse intervalo (comum em
-           oclusões breves que causam flicker de detecção), não inicia um novo par.
+        Algoritmo (spec — Dashboard Analytics Tópico 1: Perda de Vendas & Gargalos):
+        1. Monitora 'Zona do Atendente' e 'Zona do Cliente' simultaneamente. A
+           presença bruta em cada zona passa primeiro pelo debounce
+           (_atualizar_debounce/ZONA_DEBOUNCE_SEGUNDOS) antes de virar evento —
+           filtra flicker de detecção/oclusão breve na borda do polígono.
+        2. Toda pessoa cuja entrada na 'Zona Cliente' é CONFIRMADA abre uma sessão
+           de fila (não depende de um atendente já estar presente — só assim dá
+           pra medir tempo de espera e desistência de quem nunca é atendido) e
+           dispara CLIENT_ENTERED_ZONE. O mesmo vale para ATTENDANT_ENTERED_ZONE
+           na 'Zona Atendente', independente de sessão de cliente.
+        3. Assim que um atendente está confirmado presente ENQUANTO a sessão está
+           ativa, marca-se `momento_atendente_chegou` (uma vez só, a primeira vez) —
+           a diferença para `inicio` é o tempo de espera na fila. Se a presença
+           conjunta seguir por >= ATENDIMENTO_MIN_SEGUNDOS, a sessão é confirmada
+           como "Atendimento Em Andamento" e dispara SERVICE_STARTED.
+        4. Quando a saída do cliente da zona é CONFIRMADA, a sessão é encerrada:
+           grava-se em MetricaAtendimento a duração total, o tempo de espera
+           (nulo se nunca houve atendente), `concluido` e `desistiu`; dispara
+           CLIENT_EXITED_ZONE sempre, mais SERVICE_ENDED (se houve SERVICE_STARTED)
+           ou ABANDONMENT_DETECTED (se nunca atendido e permaneceu
+           >= DESISTENCIA_MIN_SEGUNDOS). Mesma saída confirmada para o atendente
+           dispara ATTENDANT_EXITED_ZONE.
+        5. Anti-duplicação extra: ao encerrar, o track_id do cliente entra em
+           cooldown por CLIENTE_COOLDOWN_SEGUNDOS — se a entrada reaparecer
+           confirmada nesse intervalo (pessoa realmente saiu e voltou rápido, não
+           flicker — isso o debounce já filtra sozinho), não abre nova sessão.
+        6. Alerta "Pico de Fila Sem Atendente": quando a zona 'Cliente' atinge
+           PICO_FILA_MIN_PESSOAS simultâneas (confirmados) com a zona 'Atendente'
+           vazia por PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS contínuos, registra um
+           alerta (uma vez por ocorrência contínua).
+
+        Nenhum evento é gravado frame a frame: tudo aqui só dispara em transições
+        de estado já confirmadas — ver EventoZona e MetricaAtendimento.
         """
         zonas_atendente = self._zonas_do_tipo("atendente")
         zonas_cliente = self._zonas_do_tipo("cliente")
         if not zonas_atendente or not zonas_cliente:
             return  # perfil balcão sem as duas zonas configuradas: nada a rastrear ainda
 
-        tracks_em_atendente = set()
-        tracks_em_cliente = set()
-        for track_id, (cx, cy, _, _) in centros.items():
-            if any(z.contem_ponto(cx, cy, w, h) for z in zonas_atendente):
-                tracks_em_atendente.add(track_id)
-            if any(z.contem_ponto(cx, cy, w, h) for z in zonas_cliente):
-                tracks_em_cliente.add(track_id)
+        raw_em_atendente = {
+            tid for tid, (cx, cy, _, _) in centros.items() if any(z.contem_ponto(cx, cy, w, h) for z in zonas_atendente)
+        }
+        raw_em_cliente = {
+            tid for tid, (cx, cy, _, _) in centros.items() if any(z.contem_ponto(cx, cy, w, h) for z in zonas_cliente)
+        }
+
+        tracks_em_atendente, entradas_atendente, saidas_atendente = self._atualizar_debounce(
+            self._debounce_atendente, raw_em_atendente, agora
+        )
+        tracks_em_cliente, entradas_cliente, saidas_cliente = self._atualizar_debounce(
+            self._debounce_cliente, raw_em_cliente, agora
+        )
+
+        for tid in entradas_atendente:
+            self._registrar_evento_zona(models.TipoEventoZona.attendant_entered_zone, track_id=tid)
+        for tid, duracao in saidas_atendente.items():
+            self._registrar_evento_zona(
+                models.TipoEventoZona.attendant_exited_zone, track_id=tid, duracao_segundos=duracao
+            )
 
         # Purga cooldowns expirados
         expirados = [
@@ -406,29 +547,91 @@ class VideoProcessor:
         for tid in expirados:
             del self._cooldown_clientes[tid]
 
-        # Inicia cronômetro para clientes novos na zona — exige atendente presente
-        # NO MESMO INSTANTE (presença simultânea, conforme a especificação).
-        if tracks_em_atendente:
-            atendente_ref = next(iter(tracks_em_atendente))
-            for tid in tracks_em_cliente:
-                if tid in self._pares_atendimento or tid in self._cooldown_clientes:
-                    continue
-                self._pares_atendimento[tid] = ParAtendimento(atendente_track_id=atendente_ref, inicio=agora)
+        # Abre sessão de fila para toda entrada confirmada na 'Zona Cliente'.
+        for tid in entradas_cliente:
+            if tid in self._cooldown_clientes:
+                continue
+            self._sessoes_fila[tid] = SessaoFilaCliente(inicio=agora)
+            self._registrar_evento_zona(models.TipoEventoZona.client_entered_zone, track_id=tid)
 
-        # Atualiza/encerra pares ativos
-        for tid in list(self._pares_atendimento.keys()):
-            par = self._pares_atendimento[tid]
-            if tid in tracks_em_cliente:
-                if not par.confirmado and (agora - par.inicio) >= config.ATENDIMENTO_MIN_SEGUNDOS:
-                    par.confirmado = True  # validado como "Atendimento Em Andamento"
-            else:
-                # Cliente saiu da zona: encerra o cronômetro e persiste o atendimento.
-                duracao = agora - par.inicio
-                self._salvar_metrica_atendimento(duracao, concluido=par.confirmado)
-                del self._pares_atendimento[tid]
-                self._cooldown_clientes[tid] = agora
+        # Atualiza sessões ativas: chegada do atendente + confirmação de atendimento.
+        atendente_presente_agora = bool(tracks_em_atendente)
+        for tid in tracks_em_cliente:
+            sessao = self._sessoes_fila.get(tid)
+            if sessao is None:
+                continue
+            if atendente_presente_agora and sessao.momento_atendente_chegou is None:
+                sessao.momento_atendente_chegou = agora
+            if (
+                sessao.momento_atendente_chegou is not None
+                and not sessao.confirmado
+                and (agora - sessao.momento_atendente_chegou) >= config.ATENDIMENTO_MIN_SEGUNDOS
+            ):
+                sessao.confirmado = True  # validado como "Atendimento Em Andamento"
+                self._registrar_evento_zona(models.TipoEventoZona.service_started, track_id=tid)
 
-    def _salvar_metrica_atendimento(self, duracao_segundos: float, concluido: bool) -> None:
+        # Encerra sessões cuja saída da 'Zona Cliente' acabou de ser confirmada.
+        for tid in saidas_cliente:
+            sessao = self._sessoes_fila.pop(tid, None)
+            if sessao is None:
+                continue
+
+            duracao_total = agora - sessao.inicio
+            atendido = sessao.momento_atendente_chegou is not None
+            tempo_espera = (sessao.momento_atendente_chegou - sessao.inicio) if atendido else None
+            desistiu = (not atendido) and duracao_total >= config.DESISTENCIA_MIN_SEGUNDOS
+
+            self._salvar_metrica_atendimento(
+                duracao_segundos=duracao_total,
+                concluido=sessao.confirmado,
+                tempo_espera_segundos=tempo_espera,
+                desistiu=desistiu,
+            )
+            self._registrar_evento_zona(
+                models.TipoEventoZona.client_exited_zone, track_id=tid, duracao_segundos=duracao_total
+            )
+            if sessao.confirmado:
+                self._registrar_evento_zona(
+                    models.TipoEventoZona.service_ended,
+                    track_id=tid,
+                    duracao_segundos=agora - sessao.momento_atendente_chegou,
+                )
+            if desistiu:
+                self._registrar_evento_zona(
+                    models.TipoEventoZona.abandonment_detected, track_id=tid, duracao_segundos=duracao_total
+                )
+
+            self._cooldown_clientes[tid] = agora
+
+        self._atualizar_pico_fila_sem_atendente(atendente_presente_agora, len(tracks_em_cliente), agora)
+
+    def _atualizar_pico_fila_sem_atendente(
+        self, atendente_presente: bool, pessoas_na_fila: int, agora: float
+    ) -> None:
+        if atendente_presente:
+            self._fila_atendente_ausente_desde = None
+            self._fila_pico_registrado = False
+            return
+
+        if self._fila_atendente_ausente_desde is None:
+            self._fila_atendente_ausente_desde = agora
+
+        ausente_ha = agora - self._fila_atendente_ausente_desde
+        if (
+            pessoas_na_fila >= config.PICO_FILA_MIN_PESSOAS
+            and ausente_ha >= config.PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS
+            and not self._fila_pico_registrado
+        ):
+            self._salvar_alerta_fila(pessoas_na_fila)
+            self._fila_pico_registrado = True  # não repete enquanto a condição persistir
+
+    def _salvar_metrica_atendimento(
+        self,
+        duracao_segundos: float,
+        concluido: bool,
+        tempo_espera_segundos: Optional[float] = None,
+        desistiu: bool = False,
+    ) -> None:
         db = self.session_factory()
         try:
             registro = models.MetricaAtendimento(
@@ -437,6 +640,67 @@ class VideoProcessor:
                 timestamp=datetime.utcnow(),
                 duracao_segundos=round(duracao_segundos, 2),
                 concluido=concluido,
+                tempo_espera_segundos=(
+                    round(tempo_espera_segundos, 2) if tempo_espera_segundos is not None else None
+                ),
+                desistiu=desistiu,
+            )
+            db.add(registro)
+            db.commit()
+        finally:
+            db.close()
+
+    def _salvar_alerta_fila(self, pessoas_na_fila: int) -> None:
+        db = self.session_factory()
+        try:
+            registro = models.AlertaFila(
+                camera_id=self.camera_id,
+                empresa_id=self.empresa_id,
+                timestamp=datetime.utcnow(),
+                pessoas_na_fila=pessoas_na_fila,
+            )
+            db.add(registro)
+            db.commit()
+        finally:
+            db.close()
+
+    # -------------------- Perfil BALCÃO/LOJA: amostragem de ocupação (Tópico 2) --------------------
+    def _atualizar_amostra_balcao(self, centros: Dict[int, Centro], w: int, h: int, agora: float) -> None:
+        """
+        Amostra periodicamente (mesma cadência de OCUPACAO_AMOSTRA_SEGUNDOS usada
+        pela ocupação genérica) quantas pessoas estão nas zonas 'Atendente' (ou
+        'Trabalho', se a câmera não tiver zona 'Atendente' dedicada) e 'Cliente'.
+        Base do Tópico 2 (ociosidade do balcão, tempo no posto vs. em atendimento e
+        distribuição de presença por horário) — calculado no backend a partir dessas
+        amostras (ver routes.dashboard_metrics), não há um relógio contínuo por
+        atendente.
+        """
+        zonas_atendente = self._zonas_do_tipo("atendente") or self._zonas_do_tipo("trabalho")
+        zonas_cliente = self._zonas_do_tipo("cliente")
+        if not zonas_atendente:
+            return  # nada configurado para medir presença de atendente
+
+        if agora - self._ultima_amostra_balcao < config.OCUPACAO_AMOSTRA_SEGUNDOS:
+            return
+        self._ultima_amostra_balcao = agora
+
+        atendentes = sum(
+            1 for cx, cy, _, _ in centros.values() if any(z.contem_ponto(cx, cy, w, h) for z in zonas_atendente)
+        )
+        clientes = sum(
+            1 for cx, cy, _, _ in centros.values() if any(z.contem_ponto(cx, cy, w, h) for z in zonas_cliente)
+        )
+        self._salvar_amostra_balcao(atendentes, clientes)
+
+    def _salvar_amostra_balcao(self, atendentes_presentes: int, clientes_presentes: int) -> None:
+        db = self.session_factory()
+        try:
+            registro = models.AmostraBalcao(
+                camera_id=self.camera_id,
+                empresa_id=self.empresa_id,
+                timestamp=datetime.utcnow(),
+                atendentes_presentes=atendentes_presentes,
+                clientes_presentes=clientes_presentes,
             )
             db.add(registro)
             db.commit()
@@ -559,8 +823,8 @@ class VideoProcessor:
 
     def _desenhar_pessoas(self, frame: np.ndarray, pessoas: List[Pessoa]) -> None:
         for _, track_id, (x1, y1, x2, y2) in pessoas:
-            par = self._pares_atendimento.get(track_id) if track_id is not None else None
-            if par and par.confirmado:
+            sessao = self._sessoes_fila.get(track_id) if track_id is not None else None
+            if sessao and sessao.confirmado:
                 cor, rotulo, espessura = (0, 220, 0), "ATENDIMENTO EM ANDAMENTO", 2
             elif track_id is not None:
                 cor, rotulo, espessura = (0, 255, 255), f"ID {track_id}", 1
@@ -596,6 +860,7 @@ class VideoProcessor:
         # 3) Lógica específica do perfil ativo da câmera
         if self.perfil == "balcao_loja":
             self._atualizar_atendimento_balcao(centros, w, h, agora)
+            self._atualizar_amostra_balcao(centros, w, h, agora)
         elif self.perfil == "escritorio":
             self._atualizar_escritorio(centros, w, h, agora)
         elif self.perfil == "estoque":
@@ -611,6 +876,37 @@ class VideoProcessor:
         return frame
 
     # -------------------- thread de processamento + streaming --------------------
+    def _verificar_desconexao_prolongada(self, agora: float) -> None:
+        """
+        Sem NENHUM frame lido da câmera por mais de CAMERA_OFFLINE_RESET_SEGUNDOS:
+        descarta as sessões/presenças em memória em vez de deixá-las penduradas.
+        Sem isso, um cliente ou atendente que estava confirmado presente quando a
+        câmera caiu ficaria com a sessão aberta durante toda a queda — ao
+        reconectar, a saída dele seria confirmada com uma duração de horas
+        (o tempo da queda), inflando/corrompendo as métricas do Dashboard
+        Analytics. Não há como fechar essas sessões corretamente (não sabemos
+        quando a pessoa realmente saiu durante a queda), então são descartadas
+        sem persistir nenhuma métrica/evento para elas — só reseta uma vez por
+        queda (`_estado_resetado_por_desconexao` evita repetir a cada 0.1s de retry).
+        """
+        if self._estado_resetado_por_desconexao:
+            return
+        if agora - self._ultima_leitura_ok_em < config.CAMERA_OFFLINE_RESET_SEGUNDOS:
+            return
+
+        self._sessoes_fila.clear()
+        self._cooldown_clientes.clear()
+        self._debounce_atendente.clear()
+        self._debounce_cliente.clear()
+        self._fila_atendente_ausente_desde = None
+        self._fila_pico_registrado = False
+        self._estado_resetado_por_desconexao = True
+        print(
+            f"[vision] câmera {self.camera_id}: sem frames há mais de "
+            f"{config.CAMERA_OFFLINE_RESET_SEGUNDOS:.0f}s — sessões/presenças em memória "
+            "descartadas (evita durações infladas pela queda de conexão ao reconectar)"
+        )
+
     def _loop_processamento(self) -> None:
         """
         Roda em background, uma vez por câmera, independente de quantos viewers HTTP
@@ -622,8 +918,12 @@ class VideoProcessor:
             inicio = time.monotonic()
             frame = self.stream.read()
             if frame is None:
+                self._verificar_desconexao_prolongada(inicio)
                 time.sleep(0.1)
                 continue
+
+            self._ultima_leitura_ok_em = inicio
+            self._estado_resetado_por_desconexao = False
 
             try:
                 processado = self.processar_frame(frame)

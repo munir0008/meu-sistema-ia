@@ -136,6 +136,32 @@ def _migrar_enum_status_assinatura() -> None:
         conn.execute(text("ALTER TYPE statusassinatura ADD VALUE IF NOT EXISTS 'pending_payment'"))
 
 
+def _migrar_colunas_fila() -> None:
+    """
+    Adiciona à tabela `metricas_atendimento`, já existente em qualquer deploy
+    anterior ao Dashboard Analytics Tópico 1, as colunas `tempo_espera_segundos`
+    e `desistiu` (ver models.MetricaAtendimento). `create_all` só cria tabelas
+    que ainda não existem — numa tabela pré-existente é preciso ALTER TABLE
+    explícito, mesmo padrão de `_migrar_para_multi_tenant` acima.
+    """
+    inspector = inspect(engine)
+    if "metricas_atendimento" not in inspector.get_table_names():
+        return  # banco novo: create_all já criou a tabela com as colunas certas
+
+    colunas = {col["name"] for col in inspector.get_columns("metricas_atendimento")}
+    with engine.begin() as conn:
+        if "tempo_espera_segundos" not in colunas:
+            conn.execute(text("ALTER TABLE metricas_atendimento ADD COLUMN tempo_espera_segundos FLOAT"))
+        if "desistiu" not in colunas:
+            # Boolean DEFAULT literal difere por dialeto (Postgres não aceita 0/1
+            # implícito para uma coluna BOOLEAN) — mesma ressalva já documentada
+            # em `_migrar_enum_status_assinatura` para diferenças Postgres/SQLite.
+            default = "FALSE" if DATABASE_URL.startswith("postgresql") else "0"
+            conn.execute(
+                text(f"ALTER TABLE metricas_atendimento ADD COLUMN desistiu BOOLEAN NOT NULL DEFAULT {default}")
+            )
+
+
 def init_db() -> None:
     """Cria todas as tabelas no banco (se não existirem) e aplica migrações pendentes."""
     import models  # noqa: F401  garante que os modelos estejam registrados no Base antes do create_all
@@ -143,6 +169,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrar_enum_status_assinatura()
     _migrar_para_multi_tenant()
+    _migrar_colunas_fila()
 
 
 def seed_super_admin() -> None:

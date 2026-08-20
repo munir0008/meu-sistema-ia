@@ -22,7 +22,7 @@ Fluxo de autenticação:
 import json
 import logging
 from collections import defaultdict
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -30,6 +30,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import config
 import emails
 import models
 import payments
@@ -628,9 +629,141 @@ def video_feed(
 #   - ADMIN/USER só consultam a própria empresa. SUPER_ADMIN consulta qualquer
 #     uma (usado no painel admin para abrir o dashboard de qualquer empresa).
 # ==============================================================================
+def _resolver_periodo_dashboard(periodo: str) -> tuple[datetime, datetime, date]:
+    """
+    Converte o filtro rápido do frontend ("hoje" | "7d" | "30d") num intervalo
+    [inicio, fim] de datetimes (UTC, mesma referência de `MetricaAtendimento.timestamp`
+    etc.). "hoje" preserva o comportamento anterior a este filtro (00:00 a
+    23:59:59.999999 do dia corrente); "7d"/"30d" contam hoje + os N-1 dias
+    anteriores. Também devolve a data de hoje, usada em `data_referencia`.
+    """
+    hoje = datetime.utcnow().date()
+    fim = datetime.combine(hoje, dt_time.max)
+    dias_anteriores = {"hoje": 0, "7d": 6, "30d": 29}.get(periodo, 0)
+    inicio = datetime.combine(hoje - timedelta(days=dias_anteriores), dt_time.min)
+    return inicio, fim, hoje
+
+
+def _calcular_metricas_fila(
+    atendimentos: list[models.MetricaAtendimento], alertas: list[models.AlertaFila]
+) -> schemas.MetricasFila:
+    """Dashboard Analytics Tópico 1 — Perda de Vendas & Gargalos de Atendimento."""
+    total_sessoes = len(atendimentos)
+    esperas = [a.tempo_espera_segundos for a in atendimentos if a.tempo_espera_segundos is not None]
+    total_desistencias = sum(1 for a in atendimentos if a.desistiu)
+
+    return schemas.MetricasFila(
+        tempo_medio_espera_segundos=round(sum(esperas) / len(esperas), 2) if esperas else 0.0,
+        total_clientes_na_fila=total_sessoes,
+        total_desistencias=total_desistencias,
+        taxa_desistencia_pct=round(total_desistencias / total_sessoes * 100, 2) if total_sessoes else 0.0,
+        picos_fila_sem_atendente=len(alertas),
+    )
+
+
+def _calcular_metricas_equipe(amostras: list[models.AmostraBalcao]) -> schemas.MetricasEquipe:
+    """
+    Dashboard Analytics Tópico 2 — Eficiência e Desempenho da Equipe. Derivado por
+    amostragem (models.AmostraBalcao, uma linha a cada OCUPACAO_AMOSTRA_SEGUNDOS) —
+    não há um relógio contínuo por atendente, então "tempo no posto"/"tempo em
+    atendimento" são estimados como (nº de amostras que satisfazem a condição) x
+    (intervalo entre amostras).
+    """
+    intervalo = config.OCUPACAO_AMOSTRA_SEGUNDOS
+    total_amostras = len(amostras)
+    amostras_com_atendente = [a for a in amostras if a.atendentes_presentes > 0]
+    amostras_em_atendimento = [
+        a for a in amostras if a.atendentes_presentes > 0 and a.clientes_presentes > 0
+    ]
+
+    tempo_no_posto = len(amostras_com_atendente) * intervalo
+    tempo_em_atendimento = len(amostras_em_atendimento) * intervalo
+
+    por_hora = defaultdict(list)
+    for a in amostras:
+        por_hora[a.timestamp.hour].append(a)
+    distribuicao_por_hora = [
+        schemas.PresencaPorHora(
+            hora=h,
+            media_atendentes_presentes=round(sum(x.atendentes_presentes for x in xs) / len(xs), 2),
+            media_clientes_presentes=round(sum(x.clientes_presentes for x in xs) / len(xs), 2),
+        )
+        for h, xs in sorted(por_hora.items())
+    ]
+
+    return schemas.MetricasEquipe(
+        taxa_ociosidade_balcao_pct=(
+            round((total_amostras - len(amostras_com_atendente)) / total_amostras * 100, 2)
+            if total_amostras
+            else 0.0
+        ),
+        tempo_no_posto_segundos=round(tempo_no_posto, 2),
+        tempo_em_atendimento_segundos=round(tempo_em_atendimento, 2),
+        ratio_atendimento_pct=round(tempo_em_atendimento / tempo_no_posto * 100, 2) if tempo_no_posto else None,
+        distribuicao_por_hora=distribuicao_por_hora,
+    )
+
+
+def _calcular_ranking_cameras(
+    cameras: list[models.Camera],
+    atendimentos: list[models.MetricaAtendimento],
+    amostras: list[models.AmostraBalcao],
+) -> schemas.RankingZonas:
+    """
+    Dashboard Analytics Tópico 4 — Ranking e Comparativo por Câmera. A granularidade
+    é por câmera (não por zona individual): o schema hoje não grava a qual zona uma
+    sessão de fila pertence — cada câmera de perfil balcão tem uma 'Zona Cliente' e
+    uma 'Zona Atendente', então câmera já equivale a um ponto de atendimento.
+    """
+    tabela: list[schemas.RankingCameraItem] = []
+    for cam in cameras:
+        atend_cam = [a for a in atendimentos if a.camera_id == cam.id]
+        amostras_cam = [a for a in amostras if a.camera_id == cam.id]
+
+        concluidos = [a for a in atend_cam if a.concluido]
+        esperas = [a.tempo_espera_segundos for a in atend_cam if a.tempo_espera_segundos is not None]
+        desistencias = sum(1 for a in atend_cam if a.desistiu)
+        amostras_com_atendente = [a for a in amostras_cam if a.atendentes_presentes > 0]
+
+        tabela.append(
+            schemas.RankingCameraItem(
+                camera_id=cam.id,
+                nome_camera=cam.nome_camera,
+                total_atendimentos_concluidos=len(concluidos),
+                tempo_medio_atendimento_segundos=(
+                    round(sum(a.duracao_segundos for a in concluidos) / len(concluidos), 2) if concluidos else 0.0
+                ),
+                tempo_medio_espera_segundos=round(sum(esperas) / len(esperas), 2) if esperas else None,
+                taxa_desistencia_pct=(
+                    round(desistencias / len(atend_cam) * 100, 2) if atend_cam else 0.0
+                ),
+                taxa_ociosidade_pct=(
+                    round((len(amostras_cam) - len(amostras_com_atendente)) / len(amostras_cam) * 100, 2)
+                    if amostras_cam
+                    else None
+                ),
+            )
+        )
+
+    com_espera = [c for c in tabela if c.tempo_medio_espera_segundos is not None]
+    mais_rapida = min(com_espera, key=lambda c: c.tempo_medio_espera_segundos, default=None)
+
+    com_desistencia = [c for c in tabela if c.taxa_desistencia_pct > 0]
+    maior_perda = max(com_desistencia, key=lambda c: c.taxa_desistencia_pct, default=None)
+
+    return schemas.RankingZonas(
+        tabela=tabela,
+        camera_mais_rapida_id=mais_rapida.camera_id if mais_rapida else None,
+        camera_maior_desistencia_id=maior_perda.camera_id if maior_perda else None,
+    )
+
+
 @router.get("/api/metrics/dashboard/{empresa_id}", response_model=schemas.DashboardMetrics, tags=["metrics"])
 def dashboard_metrics(
     empresa_id: int,
+    periodo: str = Query(
+        "hoje", pattern="^(hoje|7d|30d)$", description="Intervalo rápido: 'hoje', '7d' (7 dias) ou '30d' (30 dias)"
+    ),
     db: Session = Depends(get_db),
     atual: models.Usuario = Depends(get_current_usuario),
 ):
@@ -641,15 +774,13 @@ def dashboard_metrics(
     if not db.get(models.Empresa, empresa_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Empresa não encontrada")
 
-    hoje = datetime.utcnow().date()
-    inicio_dia = datetime.combine(hoje, dt_time.min)
-    fim_dia = datetime.combine(hoje, dt_time.max)
+    inicio, fim, hoje = _resolver_periodo_dashboard(periodo)
 
     atendimentos = (
         db.query(models.MetricaAtendimento)
         .filter(
             models.MetricaAtendimento.empresa_id == empresa_id,
-            models.MetricaAtendimento.timestamp.between(inicio_dia, fim_dia),
+            models.MetricaAtendimento.timestamp.between(inicio, fim),
         )
         .all()
     )
@@ -657,7 +788,23 @@ def dashboard_metrics(
         db.query(models.MetricaOcupacao)
         .filter(
             models.MetricaOcupacao.empresa_id == empresa_id,
-            models.MetricaOcupacao.timestamp.between(inicio_dia, fim_dia),
+            models.MetricaOcupacao.timestamp.between(inicio, fim),
+        )
+        .all()
+    )
+    amostras_balcao = (
+        db.query(models.AmostraBalcao)
+        .filter(
+            models.AmostraBalcao.empresa_id == empresa_id,
+            models.AmostraBalcao.timestamp.between(inicio, fim),
+        )
+        .all()
+    )
+    alertas_fila = (
+        db.query(models.AlertaFila)
+        .filter(
+            models.AlertaFila.empresa_id == empresa_id,
+            models.AlertaFila.timestamp.between(inicio, fim),
         )
         .all()
     )
@@ -713,6 +860,7 @@ def dashboard_metrics(
     return schemas.DashboardMetrics(
         empresa_id=empresa_id,
         data_referencia=hoje.isoformat(),
+        periodo=periodo,
         total_atendimentos=total_atendimentos,
         atendimentos_concluidos=concluidos,
         atendimentos_abandonados=abandonados,
@@ -723,6 +871,9 @@ def dashboard_metrics(
         horarios_pico=horarios_pico,
         ocupacao_por_hora=ocupacao_por_hora,
         por_camera=por_camera,
+        fila=_calcular_metricas_fila(atendimentos, alertas_fila),
+        equipe=_calcular_metricas_equipe(amostras_balcao),
+        ranking=_calcular_ranking_cameras(cameras, atendimentos, amostras_balcao),
     )
 
 

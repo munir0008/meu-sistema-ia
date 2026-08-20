@@ -79,3 +79,10 @@ export const STATUS_ASSINATURA = {
 export const PLANO_LABELS = {
   completo: "Plano Completo",
 };
+
+/** Rótulo do filtro rápido de período do Dashboard Analytics (ver PeriodoToggle). */
+export const PERIODO_LABELS = {
+  hoje: "hoje",
+  "7d": "nos últimos 7 dias",
+  "30d": "nos últimos 30 dias",
+};

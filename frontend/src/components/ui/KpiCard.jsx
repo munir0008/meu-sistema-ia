@@ -1,4 +1,6 @@
-export default function KpiCard({ icon: Icon, label, value, hint, tone = "cyan" }) {
+import InfoTooltip from "./InfoTooltip";
+
+export default function KpiCard({ icon: Icon, label, value, hint, tone = "cyan", tooltip }) {
   const tones = {
     cyan: "bg-cyan-500/10 text-cyan-600 dark:text-cyan-400",
     indigo: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400",
@@ -10,7 +12,10 @@ export default function KpiCard({ icon: Icon, label, value, hint, tone = "cyan" 
   return (
     <div className="rounded-xl border border-neutral-200 bg-white p-5 dark:border-neutral-800 dark:bg-neutral-900/60">
       <div className="flex items-center justify-between">
-        <span className="text-xs font-medium text-neutral-500">{label}</span>
+        <span className="flex items-center gap-1.5 text-xs font-medium text-neutral-500">
+          {label}
+          {tooltip && <InfoTooltip text={tooltip} />}
+        </span>
         {Icon && (
           <span className={`flex size-8 items-center justify-center rounded-lg ${tones[tone]}`}>
             <Icon className="size-4" />

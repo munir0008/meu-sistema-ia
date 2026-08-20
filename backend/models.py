@@ -83,6 +83,30 @@ class PlanoAssinatura(str, enum.Enum):
     completo = "completo"
 
 
+class TipoEventoZona(str, enum.Enum):
+    """
+    Vocabulário de telemetria do pipeline de visão computacional (perfil
+    balcao_loja) — ver vision.VideoProcessor._atualizar_atendimento_balcao e
+    models.EventoZona. Cada valor é um evento discreto e já debounced (não
+    dispara em flicker de detecção — ver config.ZONA_DEBOUNCE_SEGUNDOS).
+    """
+
+    client_entered_zone = "CLIENT_ENTERED_ZONE"
+    client_exited_zone = "CLIENT_EXITED_ZONE"
+    attendant_entered_zone = "ATTENDANT_ENTERED_ZONE"
+    attendant_exited_zone = "ATTENDANT_EXITED_ZONE"
+    # Presença conjunta (atendente + este cliente) sustentada por
+    # >= ATENDIMENTO_MIN_SEGUNDOS — mesmo instante em que MetricaAtendimento.concluido
+    # passaria a True para essa sessão.
+    service_started = "SERVICE_STARTED"
+    # Cliente saiu da zona depois de um SERVICE_STARTED — duracao_segundos é o
+    # tempo efetivo em atendimento (do SERVICE_STARTED até a saída).
+    service_ended = "SERVICE_ENDED"
+    # Cliente saiu da zona sem nunca ter havido SERVICE_STARTED, tendo permanecido
+    # >= DESISTENCIA_MIN_SEGUNDOS — equivalente a MetricaAtendimento.desistiu=True.
+    abandonment_detected = "ABANDONMENT_DETECTED"
+
+
 class Empresa(Base):
     __tablename__ = "empresas"
 
@@ -146,14 +170,33 @@ class Zona(Base):
 
 
 class MetricaAtendimento(Base):
+    """
+    Uma linha por "sessão de fila": da entrada de uma pessoa na zona 'Cliente' até
+    sua saída dessa zona — independente de ter chegado a ser atendida ou não (ver
+    vision.VideoProcessor._atualizar_atendimento_balcao). Base do Dashboard
+    Analytics Tópico 1 (Perda de Vendas & Gargalos de Atendimento).
+    """
+
     __tablename__ = "metricas_atendimento"
 
     id = Column(Integer, primary_key=True, index=True)
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False, index=True)
     empresa_id = Column(Integer, ForeignKey("empresas.id"), nullable=False, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    # Tempo total da sessão na zona 'Cliente' (da entrada à saída) — antes desta
+    # métrica existir, era só a duração da presença conjunta com o atendente;
+    # agora cobre também clientes que nunca chegaram a ser atendidos.
     duracao_segundos = Column(Float, nullable=False)
+    # True quando a presença conjunta atendente+cliente foi sustentada por
+    # >= ATENDIMENTO_MIN_SEGUNDOS (ver config.py) — "Atendimento Em Andamento".
     concluido = Column(Boolean, default=False, nullable=False)
+    # Segundos entre a entrada na zona 'Cliente' e a primeira vez que um atendente
+    # foi detectado presente na zona 'Atendente' durante essa sessão. Nulo quando
+    # nenhum atendente esteve presente enquanto o cliente estava na zona.
+    tempo_espera_segundos = Column(Float, nullable=True)
+    # True quando o cliente permaneceu >= DESISTENCIA_MIN_SEGUNDOS na zona sem
+    # nunca ter havido um atendente presente (tempo_espera_segundos nulo).
+    desistiu = Column(Boolean, default=False, nullable=False)
 
 
 class MetricaOcupacao(Base):
@@ -165,3 +208,73 @@ class MetricaOcupacao(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     pessoas_detectadas = Column(Integer, default=0, nullable=False)
     tempo_inatividade_segundos = Column(Float, default=0.0, nullable=False)
+
+
+class AmostraBalcao(Base):
+    """
+    Amostragem periódica (a cada OCUPACAO_AMOSTRA_SEGUNDOS, ver config.py) da
+    ocupação das zonas 'Atendente'/'Trabalho' e 'Cliente' de câmeras com perfil
+    balcao_loja — ver vision.VideoProcessor._atualizar_amostra_balcao.
+
+    Base do Dashboard Analytics Tópico 2 (Eficiência e Desempenho da Equipe):
+    ociosidade do balcão, tempo no posto vs. tempo em atendimento, e distribuição
+    de presença por horário — tudo derivado por amostragem (não há um relógio
+    contínuo por atendente), o mesmo padrão já usado por MetricaOcupacao.
+    """
+
+    __tablename__ = "amostras_balcao"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False, index=True)
+    empresa_id = Column(Integer, ForeignKey("empresas.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    atendentes_presentes = Column(Integer, default=0, nullable=False)
+    clientes_presentes = Column(Integer, default=0, nullable=False)
+
+
+class EventoZona(Base):
+    """
+    Log granular de telemetria do pipeline de visão (perfil balcao_loja): uma
+    linha por evento de zona/atendimento (ver TipoEventoZona), sempre disparado
+    a partir de uma TRANSIÇÃO de estado já debounced — nunca frame a frame (ver
+    vision.VideoProcessor._atualizar_debounce e config.ZONA_DEBOUNCE_SEGUNDOS).
+
+    Complementa (não substitui) `MetricaAtendimento`: esta tabela é o registro
+    granular evento-a-evento (útil para auditoria/depuração e uma futura feed de
+    atividade em tempo real); `MetricaAtendimento` continua sendo o agregado por
+    sessão que o Dashboard Analytics consome hoje.
+    """
+
+    __tablename__ = "eventos_zona"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False, index=True)
+    empresa_id = Column(Integer, ForeignKey("empresas.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    tipo_evento = Column(SAEnum(TipoEventoZona), nullable=False, index=True)
+    # ID de rastreamento (ByteTrack) da pessoa envolvida no evento.
+    track_id = Column(Integer, nullable=True)
+    # Duração associada ao evento, quando fizer sentido (nulo em eventos de
+    # entrada, que ainda não têm duração a medir):
+    #   CLIENT_EXITED_ZONE / ATTENDANT_EXITED_ZONE -> tempo total na zona
+    #   SERVICE_ENDED -> tempo efetivo em atendimento (desde o SERVICE_STARTED)
+    #   ABANDONMENT_DETECTED -> tempo total esperado na fila
+    duracao_segundos = Column(Float, nullable=True)
+
+
+class AlertaFila(Base):
+    """
+    Um evento por "pico de fila sem atendente": a zona 'Cliente' atingiu
+    PICO_FILA_MIN_PESSOAS (ou mais) pessoas simultâneas enquanto a zona
+    'Atendente' esteve vazia por PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS contínuos
+    (ver config.py e vision.VideoProcessor._atualizar_atendimento_balcao). Só um
+    registro por ocorrência contínua — não repete enquanto a condição persiste.
+    """
+
+    __tablename__ = "alertas_fila"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False, index=True)
+    empresa_id = Column(Integer, ForeignKey("empresas.id"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    pessoas_na_fila = Column(Integer, nullable=False)

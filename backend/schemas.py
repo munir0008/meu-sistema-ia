@@ -199,9 +199,65 @@ class MetricasPorCamera(BaseModel):
     media_pessoas_detectadas: float
 
 
+# ---------- Dashboard Analytics: Tópico 1 — Perda de Vendas & Gargalos ----------
+class MetricasFila(BaseModel):
+    """
+    Ver vision.VideoProcessor._atualizar_atendimento_balcao e
+    models.MetricaAtendimento (tempo_espera_segundos/desistiu).
+    """
+
+    tempo_medio_espera_segundos: float
+    total_clientes_na_fila: int
+    total_desistencias: int
+    taxa_desistencia_pct: float
+    picos_fila_sem_atendente: int
+
+
+# ---------- Dashboard Analytics: Tópico 2 — Eficiência e Desempenho da Equipe ----------
+class PresencaPorHora(BaseModel):
+    """Distribuição por hora do dia — média de atendentes x clientes presentes por amostra (models.AmostraBalcao)."""
+
+    hora: int
+    media_atendentes_presentes: float
+    media_clientes_presentes: float
+
+
+class MetricasEquipe(BaseModel):
+    taxa_ociosidade_balcao_pct: float
+    tempo_no_posto_segundos: float
+    tempo_em_atendimento_segundos: float
+    # Proporção (%) de tempo em atendimento (atendente + cliente simultâneos) sobre
+    # o tempo total no posto — None quando não houve nenhuma amostra com atendente
+    # presente no período (nada a dividir).
+    ratio_atendimento_pct: Optional[float] = None
+    distribuicao_por_hora: List[PresencaPorHora]
+
+
+# ---------- Dashboard Analytics: Tópico 4 — Ranking e Comparativo por Câmera ----------
+class RankingCameraItem(BaseModel):
+    camera_id: int
+    nome_camera: str
+    total_atendimentos_concluidos: int
+    tempo_medio_atendimento_segundos: float
+    # None quando a câmera não teve nenhuma sessão atendida no período (nada a medir).
+    tempo_medio_espera_segundos: Optional[float] = None
+    taxa_desistencia_pct: float
+    taxa_ociosidade_pct: Optional[float] = None
+
+
+class RankingZonas(BaseModel):
+    tabela: List[RankingCameraItem]
+    # None quando não há dados suficientes (nenhuma câmera com sessão atendida/
+    # com sessões de fila) para eleger uma zona destaque.
+    camera_mais_rapida_id: Optional[int] = None
+    camera_maior_desistencia_id: Optional[int] = None
+
+
 class DashboardMetrics(BaseModel):
     empresa_id: int
     data_referencia: str
+    # "hoje" | "7d" | "30d" — intervalo efetivamente usado para calcular tudo abaixo.
+    periodo: str = "hoje"
     total_atendimentos: int
     atendimentos_concluidos: int
     atendimentos_abandonados: int
@@ -212,3 +268,6 @@ class DashboardMetrics(BaseModel):
     horarios_pico: List[HorarioPico]
     ocupacao_por_hora: List[OcupacaoPorHora]
     por_camera: Dict[int, MetricasPorCamera]
+    fila: MetricasFila
+    equipe: MetricasEquipe
+    ranking: RankingZonas

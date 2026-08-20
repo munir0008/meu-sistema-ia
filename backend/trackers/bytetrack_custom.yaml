@@ -1,0 +1,30 @@
+# ByteTrack ajustado para este projeto (câmeras de balcão/loja/escritório com
+# FPS moderado — ver config.STREAM_TARGET_FPS, default 15 FPS). Baseado no
+# bytetrack.yaml padrão do Ultralytics (ultralytics/cfg/trackers/bytetrack.yaml),
+# com uma única mudança:
+#
+#   track_buffer: 30 (padrão, ~2s a 15 FPS) -> 90 (~6s a 15 FPS)
+#
+# `track_buffer` é quantos FRAMES um track "perdido" (sem nenhuma detecção
+# associada) fica vivo antes do ByteTrack desistir dele e, se a pessoa
+# reaparecer depois disso, atribuir um track_id NOVO. 2s é pouco para o caso de
+# uso real: alguém passando atrás de um pilar, atrás de outro atendente, ou
+# saindo do enquadramento por um instante — qualquer uma dessas oclusões
+# facilmente passa de 2s. Com 6s de buffer, a pessoa mantém o MESMO ID ao
+# reaparecer, o que é essencial para os eventos SERVICE_STARTED/SERVICE_ENDED e
+# para o cálculo de tempo de espera/desistência do Dashboard Analytics não
+# quebrarem uma sessão em duas por causa de um track_id trocado no meio dela.
+#
+# Trade-off documentado pelo próprio Ultralytics: buffer maior aumenta o risco
+# de "ID switch" (duas pessoas diferentes, uma entrando enquanto o buffer de
+# outra que saiu ainda está aberto, acabarem trocando de ID) — aceitável aqui
+# porque as zonas de atendimento (balcão) tipicamente têm poucas pessoas
+# simultâneas. Se mudar STREAM_TARGET_FPS, ajuste também este valor:
+# buffer_desejado_em_segundos * STREAM_TARGET_FPS.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: true
