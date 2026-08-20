@@ -10,6 +10,7 @@ Sem chaves configuradas (STRIPE_SECRET_KEY vazio no .env — cenário padrão at
 o usuário preencher as chaves de teste), as funções levantam `StripeNaoConfigurado`
 em vez de deixar o SDK estourar um erro genérico.
 """
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -24,6 +25,8 @@ from config import (
     STRIPE_SECRET_KEY,
     STRIPE_WEBHOOK_SECRET,
 )
+
+logger = logging.getLogger("payments")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -114,21 +117,64 @@ def criar_portal_ou_checkout_session(
     """
     _exigir_configurado()
 
-    if empresa.stripe_customer_id:
-        try:
-            session = stripe.billing_portal.Session.create(
-                customer=empresa.stripe_customer_id,
-                return_url=f"{FRONTEND_URL}/assinatura",
-            )
-            return session.url, None
-        except stripe.error.InvalidRequestError:
-            # customer_id salvo não existe mais nessa conta/ambiente Stripe —
-            # trata como se a empresa nunca tivesse um customer.
-            empresa.stripe_customer_id = None
+    logger.info(
+        "customer-portal: empresa_id=%s tem stripe_customer_id=%r",
+        empresa.id, empresa.stripe_customer_id,
+    )
 
-    plano = empresa.plano_atual or models.PlanoAssinatura.completo
-    checkout_url = criar_checkout_session(db, empresa, plano, email_admin)
-    return None, checkout_url
+    try:
+        if empresa.stripe_customer_id:
+            try:
+                session = stripe.billing_portal.Session.create(
+                    customer=empresa.stripe_customer_id,
+                    return_url=f"{FRONTEND_URL}/assinatura",
+                )
+                logger.info(
+                    "customer-portal: portal session criada OK para empresa_id=%s", empresa.id
+                )
+                return session.url, None
+            except stripe.error.InvalidRequestError as exc:
+                # customer_id salvo não existe mais nessa conta/ambiente Stripe —
+                # trata como se a empresa nunca tivesse um customer.
+                logger.warning(
+                    "customer-portal: stripe_customer_id=%s inválido para empresa_id=%s "
+                    "(http_status=%s code=%s): %s — caindo para checkout de 1º pagamento",
+                    empresa.stripe_customer_id, empresa.id,
+                    getattr(exc, "http_status", None), getattr(exc, "code", None),
+                    exc.user_message or str(exc),
+                )
+                empresa.stripe_customer_id = None
+            except stripe.error.StripeError as exc:
+                # Qualquer outro erro da Stripe (auth, permissão, rede, rate limit...)
+                # não tem fallback óbvio — loga com o máximo de detalhe e propaga.
+                logger.exception(
+                    "customer-portal: erro Stripe %s ao abrir portal p/ empresa_id=%s "
+                    "(http_status=%s code=%s request_id=%s)",
+                    type(exc).__name__, empresa.id,
+                    getattr(exc, "http_status", None), getattr(exc, "code", None),
+                    getattr(exc, "request_id", None),
+                )
+                raise
+
+        plano = empresa.plano_atual or models.PlanoAssinatura.completo
+        logger.info(
+            "customer-portal: sem customer válido — criando checkout de 1º pagamento "
+            "p/ empresa_id=%s plano=%s",
+            empresa.id, plano,
+        )
+        checkout_url = criar_checkout_session(db, empresa, plano, email_admin)
+        return None, checkout_url
+    except StripeNaoConfigurado:
+        raise
+    except Exception:
+        # Pega qualquer coisa que não seja Stripe (erro de banco no commit, etc.)
+        # que de outra forma viraria um 500 "Internal Server Error" sem corpo
+        # JSON — o que faz o frontend perder o `detail` e cair na mensagem
+        # genérica. Loga com traceback completo pra aparecer no Render.
+        logger.exception(
+            "customer-portal: falha inesperada (não-Stripe) para empresa_id=%s", empresa.id
+        )
+        raise
 
 
 def construir_evento_webhook(payload: bytes, assinatura: Optional[str]) -> "stripe.Event":

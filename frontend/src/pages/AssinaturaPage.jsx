@@ -60,13 +60,23 @@ export default function AssinaturaPage() {
     setAcaoCarregando("portal");
     setErro(null);
     try {
-      const { portal_url: portalUrl, checkout_url: checkoutUrl } = await paymentsApi.abrirPortalCliente();
-      const destino = portalUrl || checkoutUrl;
-      if (!destino) throw new Error("resposta sem URL");
+      const resposta = await paymentsApi.abrirPortalCliente();
+      const destino = resposta?.portal_url || resposta?.checkout_url;
+      if (!destino) {
+        // DEBUG temporário: back respondeu 2xx mas sem URL — loga o corpo
+        // cru pra investigar no console do navegador (F12) enquanto
+        // diagnosticamos o "Não foi possível abrir o portal" em produção.
+        console.error("[assinatura] customer-portal sem portal_url/checkout_url:", resposta);
+        throw new Error("resposta sem URL");
+      }
       // Sem stripe_customer_id válido, o backend devolve checkout_url em vez
       // de portal_url — redireciona do mesmo jeito, direto pro 1º pagamento.
       window.location.href = destino;
     } catch (err) {
+      // DEBUG temporário: loga o erro completo (status, detail, mensagem de
+      // rede) pra conseguirmos ver no console do navegador o que está
+      // realmente falhando, já que a UI só mostra uma mensagem genérica.
+      console.error("[assinatura] falha ao abrir portal/checkout:", err?.response?.status, err?.response?.data, err);
       setErro(err?.response?.data?.detail || "Não foi possível abrir o portal de assinatura. Tente novamente em instantes.");
       setAcaoCarregando(null);
     }

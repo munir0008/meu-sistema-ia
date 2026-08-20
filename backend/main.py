@@ -4,6 +4,8 @@ Ponto de entrada da aplicação FastAPI.
 Executar com:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,6 +13,13 @@ from config import BACKEND_URL, CORS_ORIGINS
 from database import init_db, seed_super_admin
 from routes import router
 from vision import camera_manager
+
+# Sem isto, os `logger.info(...)` espalhados pelo backend (payments.py,
+# routes.py, emails.py) ficam mudos: o root logger do Python nasce em WARNING
+# e sem handler, e o uvicorn não configura isso pra gente — só os próprios
+# loggers "uvicorn.*". Nível INFO aqui é o que faz os logs de diagnóstico do
+# fluxo de pagamento (Stripe) aparecerem no dashboard do Render.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI(
     title="Plataforma SaaS de Inteligência Operacional por Câmeras",

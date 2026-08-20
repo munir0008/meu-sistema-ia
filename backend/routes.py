@@ -20,6 +20,7 @@ Fluxo de autenticação:
    assinatura ativa — inclui contas recém-cadastradas em `pending_payment`).
 """
 import json
+import logging
 from collections import defaultdict
 from datetime import date, datetime, time as dt_time
 from typing import Optional
@@ -47,6 +48,7 @@ from database import SessionLocal, get_db
 from vision import camera_manager
 
 router = APIRouter()
+logger = logging.getLogger("routes")
 
 SUPER_ADMIN = models.RoleUsuario.super_admin
 ADMIN = models.RoleUsuario.admin
@@ -838,6 +840,33 @@ def customer_portal(
         portal_url, checkout_url = payments.criar_portal_ou_checkout_session(db, empresa, atual.email)
     except payments.StripeNaoConfigurado as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Exception as exc:
+        # Sem isto, uma exceção não prevista (Stripe ou banco) vira o 500
+        # plain-text padrão do Starlette — sem corpo JSON, o frontend perde
+        # o `detail` e mostra sempre a mensagem genérica. Loga o traceback
+        # completo (aparece no dashboard do Render) e devolve um detail real.
+        logger.exception(
+            "customer-portal: erro não tratado para empresa_id=%s", empresa.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Não foi possível abrir o portal de assinatura ({type(exc).__name__}: {exc})",
+        ) from exc
+
+    if not portal_url and not checkout_url:
+        logger.error(
+            "customer-portal: nem portal_url nem checkout_url voltaram para empresa_id=%s",
+            empresa.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A Stripe não retornou uma URL válida. Tente novamente em instantes.",
+        )
+
+    logger.info(
+        "customer-portal: resposta OK para empresa_id=%s (portal=%s, checkout=%s)",
+        empresa.id, bool(portal_url), bool(checkout_url),
+    )
     return schemas.CustomerPortalOut(portal_url=portal_url, checkout_url=checkout_url)
 
 
