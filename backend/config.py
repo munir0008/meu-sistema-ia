@@ -112,9 +112,14 @@ BLUR_KERNEL = int(os.getenv("BLUR_KERNEL", "51"))  # precisa ser ímpar
 # --- Regras de negócio por perfil de câmera (ajustáveis por variável de ambiente) ---
 
 # Balcão/Loja: tempo mínimo de presença conjunta (atendente + cliente) para validar
-# um "Atendimento Em Andamento". Abaixo disso, o evento ainda é registrado ao sair,
-# porém marcado como não concluído (abandono/passagem rápida).
-ATENDIMENTO_MIN_SEGUNDOS = float(os.getenv("ATENDIMENTO_MIN_SEGUNDOS", "15"))
+# um "Atendimento Em Andamento" (dispara SERVICE_STARTED). Default 0 = qualquer
+# co-presença confirmada (já passou pelo debounce de zona, ver ZONA_DEBOUNCE_SEGUNDOS
+# abaixo) já conta como atendimento imediatamente, mesmo que dure poucos segundos —
+# não existe mais um piso de duração mínima para um atendimento ser válido. Suba
+# esse valor só se quiser voltar a exigir uma presença conjunta sustentada por mais
+# tempo antes de confirmar (abaixo do limiar, o evento ainda é registrado ao sair,
+# porém como não concluído/abandono).
+ATENDIMENTO_MIN_SEGUNDOS = float(os.getenv("ATENDIMENTO_MIN_SEGUNDOS", "0"))
 
 # Balcão/Loja: por quantos segundos após o cliente sair da zona o ID de rastreamento
 # dele fica "em cooldown", ignorado caso reapareça (evita recontagem por flicker de
@@ -152,8 +157,10 @@ PICO_FILA_ATENDENTE_AUSENTE_SEGUNDOS = float(os.getenv("PICO_FILA_ATENDENTE_AUSE
 # ('Atendente'/'Cliente') precisa se manter estável antes de ser confirmada como
 # entrada/saída de verdade (debounce/histerese) — filtra flicker de detecção
 # (oscilação de confiança na borda do polígono, oclusão de 1-2 frames) sem
-# atrasar demais os eventos de telemetria (ver vision.DebouncePresenca).
-ZONA_DEBOUNCE_SEGUNDOS = float(os.getenv("ZONA_DEBOUNCE_SEGUNDOS", "2.5"))
+# atrasar demais os eventos de telemetria (ver vision.DebouncePresenca). Com
+# ATENDIMENTO_MIN_SEGUNDOS=0 (acima), este é o ÚNICO filtro entre uma detecção
+# bruta e um SERVICE_STARTED — mantenha baixo (1-2s) de propósito.
+ZONA_DEBOUNCE_SEGUNDOS = float(os.getenv("ZONA_DEBOUNCE_SEGUNDOS", "2.0"))
 
 # Por quantos segundos sem NENHUM frame lido da câmera (queda de conexão) o
 # estado de sessões/presença em memória de uma câmera é descartado ao invés de
