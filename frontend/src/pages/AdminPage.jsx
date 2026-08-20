@@ -80,7 +80,7 @@ export default function AdminPage() {
 
   const empresaSelecionada = empresas.find((e) => e.id === empresaSelecionadaId);
   const status = empresaSelecionada
-    ? STATUS_ASSINATURA[empresaSelecionada.status_assinatura] || STATUS_ASSINATURA.trial
+    ? STATUS_ASSINATURA[empresaSelecionada.status_assinatura] || STATUS_ASSINATURA.pending_payment
     : null;
 
   return (

@@ -72,7 +72,7 @@ export default function AssinaturaPage() {
   if (erro && !empresa) return <ErrorBanner>{erro}</ErrorBanner>;
   if (!empresa) return null;
 
-  const status = STATUS_ASSINATURA[empresa.status_assinatura] || STATUS_ASSINATURA.trial;
+  const status = STATUS_ASSINATURA[empresa.status_assinatura] || STATUS_ASSINATURA.pending_payment;
   const temAssinaturaStripe = !!empresa.stripe_customer_id;
 
   return (

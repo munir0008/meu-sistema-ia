@@ -36,12 +36,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"
 SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "admin@visionsaas.com")
 SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "admin123")
 
-# --- SaaS / assinaturas ---
-# Duração do período de teste gratuito concedido a toda empresa nova (cadastro
-# público em /api/auth/signup e também às empresas herdadas na migração do
-# esquema antigo — ver database._migrar_para_multi_tenant).
-TRIAL_DIAS = int(os.getenv("TRIAL_DIAS", "14"))
-
 # URL pública do frontend, usada para montar as URLs de retorno do Stripe Checkout
 # e do Customer Portal (success_url/cancel_url/return_url) e como origem permitida
 # de CORS por padrão (ver CORS_ORIGINS, abaixo).

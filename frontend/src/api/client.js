@@ -44,9 +44,10 @@ export const NOME_EMPRESA_STORAGE_KEY = "vision_saas_nome_empresa";
  * pode fazer). O interceptor injeta automaticamente "Authorization: Bearer <token>"
  * e reage a dois status especiais:
  * - 401: token ausente/expirado/inválido — limpa a sessão e manda para o login.
- * - 403 com detail.code="subscription_required": a empresa não está em trial nem
- *   com assinatura ativa — manda para a página de planos em vez de deslogar
- *   (a sessão continua válida, só o acesso às rotas de negócio está bloqueado).
+ * - 403 com detail.code="subscription_required": a empresa não está com
+ *   assinatura ativa (inclui contas recém-cadastradas, com pagamento
+ *   pendente) — manda para a página de planos em vez de deslogar (a sessão
+ *   continua válida, só o acesso às rotas de negócio está bloqueado).
  */
 export const api = axios.create({
   baseURL: API_URL,

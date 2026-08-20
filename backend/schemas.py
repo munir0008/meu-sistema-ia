@@ -18,7 +18,7 @@ class LoginRequest(BaseModel):
 
 
 class SignupRequest(BaseModel):
-    """Autocadastro público: cria a Empresa (em trial) e seu primeiro usuário (ADMIN)."""
+    """Autocadastro público: cria a Empresa (status `pending_payment`) e seu primeiro usuário (ADMIN)."""
 
     nome_empresa: str = Field(min_length=2)
     nome_admin: str = Field(min_length=2)
@@ -26,10 +26,25 @@ class SignupRequest(BaseModel):
     senha: str = Field(min_length=6)
 
 
+class SignupResponse(BaseModel):
+    """
+    Resposta do autocadastro — de propósito SEM `access_token`: a conta nasce
+    com status `pending_payment` e o frontend não faz login automático, só
+    redireciona para `checkout_url` (Stripe Checkout). O admin só ganha uma
+    sessão de fato fazendo login normalmente em POST /api/auth/login, depois
+    de pagar (ou para retomar o checkout em /assinatura, se fechar a aba antes
+    de concluir o pagamento).
+    """
+
+    empresa_id: int
+    checkout_url: str
+
+
 class Token(BaseModel):
     """
-    Resposta do login/signup. Além do JWT (que já carrega `role`/`usuario_id`/
-    `empresa_id` como claims para o backend validar em cada request), devolvemos
+    Resposta do login (POST /api/auth/login). Além do JWT (que já carrega
+    `role`/`usuario_id`/`empresa_id` como claims para o backend validar em
+    cada request), devolvemos
     esses mesmos dados "abertos" para o frontend decidir o redirecionamento
     pós-login sem precisar decodificar o token.
     """

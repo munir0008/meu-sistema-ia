@@ -1,12 +1,10 @@
 """
 Configuração da conexão com o banco de dados (SQLite) via SQLAlchemy.
 """
-from datetime import datetime, timedelta
-
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from config import DATABASE_URL, TRIAL_DIAS
+from config import DATABASE_URL
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
@@ -48,9 +46,6 @@ def _migrar_para_multi_tenant() -> None:
         return  # já migrado (clientes virou clientes_legado) ou banco novo
 
     with engine.begin() as conn:
-        agora = datetime.utcnow()
-        fim_trial = agora + timedelta(days=TRIAL_DIAS)
-
         clientes = conn.execute(
             text("SELECT id, nome_empresa, email, senha_hash, role, criado_em FROM clientes")
         ).mappings().all()
@@ -67,17 +62,20 @@ def _migrar_para_multi_tenant() -> None:
                 # Preserva o id original: cliente.id vira empresa.id, o que
                 # torna o rename de coluna cliente_id -> empresa_id um simples
                 # ALTER TABLE (sem precisar remapear FKs linha a linha).
+                # `pending_payment`, não `active`: preserva a mesma trava de pagamento de
+                # qualquer cadastro novo — a empresa migrada do esquema antigo só recupera
+                # acesso completando o checkout da Stripe (ver routes.signup e
+                # auth.garantir_assinatura_ativa), exatamente como qualquer conta nova.
                 conn.execute(
                     text(
                         "INSERT INTO empresas "
-                        "(id, nome_empresa, criado_em, status_assinatura, data_fim_periodo) "
-                        "VALUES (:id, :nome_empresa, :criado_em, 'trial', :fim_trial)"
+                        "(id, nome_empresa, criado_em, status_assinatura) "
+                        "VALUES (:id, :nome_empresa, :criado_em, 'pending_payment')"
                     ),
                     {
                         "id": c["id"],
                         "nome_empresa": c["nome_empresa"],
                         "criado_em": c["criado_em"],
-                        "fim_trial": fim_trial,
                     },
                 )
                 empresa_id = c["id"]
@@ -114,11 +112,36 @@ def _migrar_para_multi_tenant() -> None:
     )
 
 
+def _migrar_enum_status_assinatura() -> None:
+    """
+    Adiciona o label `pending_payment` (novo estado inicial de toda empresa
+    cadastrada — ver models.StatusAssinatura e routes.signup) ao tipo ENUM
+    nativo do Postgres, caso ainda não exista.
+
+    `Base.metadata.create_all` só cria o tipo ENUM na primeira vez — rodando
+    de novo num banco que já tem `statusassinatura` criado (qualquer deploy
+    depois do primeiro) ele não adiciona labels novos ao enum do Python, e um
+    INSERT/UPDATE com 'pending_payment' falharia em produção sem isso. SQLite
+    (dev local) não tem ENUM nativo (a checagem de valores vira um simples
+    CHECK constraint recriado do zero a cada `create_all` em banco novo), então
+    não precisa dessa migração — só apague `backend/saas_cameras.db` se seu
+    banco local for de antes dessa mudança.
+
+    `ALTER TYPE ... ADD VALUE` não pode rodar dentro de uma transação em
+    versões antigas do Postgres, por isso a conexão AUTOCOMMIT dedicada.
+    """
+    if not DATABASE_URL.startswith("postgresql"):
+        return
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("ALTER TYPE statusassinatura ADD VALUE IF NOT EXISTS 'pending_payment'"))
+
+
 def init_db() -> None:
     """Cria todas as tabelas no banco (se não existirem) e aplica migrações pendentes."""
     import models  # noqa: F401  garante que os modelos estejam registrados no Base antes do create_all
 
     Base.metadata.create_all(bind=engine)
+    _migrar_enum_status_assinatura()
     _migrar_para_multi_tenant()
 
 

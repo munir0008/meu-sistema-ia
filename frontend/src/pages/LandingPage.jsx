@@ -7,22 +7,18 @@ import PricingSection from "../components/landing/PricingSection";
 
 /**
  * Landing page comercial (rota pública "/"). "Assinar Agora" leva ao cadastro
- * já com o plano escolhido na URL (`/registrar?plano=...`) — o checkout do
- * Stripe só acontece depois do cadastro, já autenticado (ver SignupPage).
+ * (`/registrar`) — o cadastro já redireciona direto para o Stripe Checkout
+ * assim que a empresa/admin são criados, sem login automático (ver SignupPage).
  */
 export default function LandingPage() {
   const navigate = useNavigate();
-
-  function selecionarPlano(chave) {
-    navigate(`/registrar?plano=${chave}`);
-  }
 
   return (
     <div className="min-h-screen bg-neutral-50 dark:bg-neutral-950">
       <LandingNavbar />
       <HeroSection />
       <FeaturesSection />
-      <PricingSection onSelecionar={selecionarPlano} />
+      <PricingSection onSelecionar={() => navigate("/registrar")} />
       <LandingFooter />
     </div>
   );

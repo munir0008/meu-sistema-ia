@@ -70,7 +70,9 @@ def _obter_ou_criar_empresa(db, dados: dict) -> tuple[models.Empresa, bool]:
 
     empresa = models.Empresa(
         nome_empresa=dados["nome_empresa"],
-        status_assinatura=models.StatusAssinatura.trial,
+        # `active` (não `pending_payment`): dados de teste locais, sem passar pela
+        # Stripe — devem funcionar de primeira, sem exigir checkout.
+        status_assinatura=models.StatusAssinatura.active,
     )
     db.add(empresa)
     db.flush()

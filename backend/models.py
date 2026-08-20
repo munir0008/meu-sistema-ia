@@ -61,7 +61,16 @@ class RoleUsuario(str, enum.Enum):
 
 
 class StatusAssinatura(str, enum.Enum):
+    # Legado: cadastros feitos antes do pagamento se tornar obrigatório no
+    # autocadastro (ver routes.signup). NÃO concede mais acesso — excluído de
+    # auth._ASSINATURAS_VALIDAS — mantido só para não quebrar a leitura de
+    # linhas antigas no banco (o tipo ENUM nativo do Postgres não permite
+    # remover um label depois de criado).
     trial = "trial"
+    # Estado inicial de toda empresa recém-cadastrada: existe no banco, mas
+    # nenhuma rota de negócio libera acesso até o webhook da Stripe confirmar
+    # o pagamento (checkout.session.completed) e promover para `active`.
+    pending_payment = "pending_payment"
     active = "active"
     past_due = "past_due"
     canceled = "canceled"

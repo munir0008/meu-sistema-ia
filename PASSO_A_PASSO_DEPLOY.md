@@ -116,9 +116,9 @@ Se for usar um domínio (ex.: `app.suaempresa.com`):
 ## 6. Checklist final (smoke test em produção)
 
 - [ ] Abrir a URL da Vercel → landing page carrega.
-- [ ] `/registrar` → criar uma empresa de teste → cai no `/dashboard` já logado, `status_assinatura = trial`.
+- [ ] `/registrar` → criar uma empresa de teste → é redirecionado direto para o Stripe Checkout, sem login automático (`status_assinatura = pending_payment` até o pagamento confirmar).
+- [ ] Completar o checkout (com um [cartão de teste](https://docs.stripe.com/testing) se ainda estiver em modo Teste) → fazer login (`/login`) com a conta recém-criada → confirmar que o status vira **Ativa** sozinho (webhook) em alguns segundos.
 - [ ] Cadastrar uma câmera em `/cameras`.
-- [ ] `/assinatura` → **Assinar Agora** → completar o checkout (com um [cartão de teste](https://docs.stripe.com/testing) se ainda estiver em modo Teste) → confirmar que o status vira **Ativa** sozinho (webhook) em alguns segundos.
 - [ ] Conferir se chegou o e-mail de boas-vindas e o de assinatura confirmada.
 - [ ] Logar como SUPER_ADMIN (`SUPER_ADMIN_EMAIL`/`SUPER_ADMIN_PASSWORD`) em `/login` → `/admin` → ver a empresa de teste na lista, com o total de câmeras certo → testar **Suspender** e confirmar que o painel da empresa bloqueia (403 → redireciona pra `/assinatura`).
 
@@ -127,7 +127,7 @@ Se for usar um domínio (ex.: `app.suaempresa.com`):
 ## Referência rápida de variáveis
 
 **Backend (Render)** — ver `backend/.env.example` para o detalhe de cada uma:
-`DATABASE_URL`, `SECRET_KEY`, `SUPER_ADMIN_EMAIL`, `SUPER_ADMIN_PASSWORD`, `TRIAL_DIAS`,
+`DATABASE_URL`, `SECRET_KEY`, `SUPER_ADMIN_EMAIL`, `SUPER_ADMIN_PASSWORD`,
 `FRONTEND_URL`, `BACKEND_URL`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`,
 `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID_UNICO`, `RESEND_API_KEY`, `EMAIL_FROM`,
 `CORS_ORIGINS` (opcional).

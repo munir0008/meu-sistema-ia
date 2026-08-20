@@ -1,21 +1,16 @@
 import { Camera, UserPlus } from "lucide-react";
 import { useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import * as paymentsApi from "../api/payments";
+import { Link } from "react-router-dom";
 import Button from "../components/ui/Button";
 import ErrorBanner from "../components/ui/ErrorBanner";
 import Input from "../components/ui/Input";
 import ThemeToggle from "../components/ui/ThemeToggle";
-import { rotaInicialPara, useAuth } from "../context/AuthContext";
-import { PLANO_UNICO_CHAVE } from "../utils/planos";
+import { useAuth } from "../context/AuthContext";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function SignupPage() {
   const { registrar, carregando, erro } = useAuth();
-  const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const planoDesejado = searchParams.get("plano");
 
   const [form, setForm] = useState({ nome_empresa: "", nome_admin: "", email: "", senha: "" });
   const [validacao, setValidacao] = useState({});
@@ -37,26 +32,15 @@ export default function SignupPage() {
     e.preventDefault();
     if (!validar()) return;
     try {
-      const usuario = await registrar(form);
-
-      // Veio da landing com o plano selecionado: pula direto para o Stripe
-      // Checkout em vez de cair no dashboard em trial.
-      if (planoDesejado === PLANO_UNICO_CHAVE) {
-        setRedirecionandoParaCheckout(true);
-        try {
-          const checkoutUrl = await paymentsApi.criarCheckoutSession(planoDesejado);
-          window.location.href = checkoutUrl;
-          return;
-        } catch {
-          // Stripe ainda não configurado (ou falhou) — segue para o dashboard
-          // normalmente, a empresa continua em trial e pode assinar depois.
-          setRedirecionandoParaCheckout(false);
-        }
-      }
-
-      navigate(rotaInicialPara(usuario.role), { replace: true });
+      // Sem login automático: a conta nasce com pagamento pendente (ver
+      // AuthContext.registrar) — o único destino possível daqui é o Stripe
+      // Checkout devolvido na própria resposta do cadastro.
+      const { checkout_url } = await registrar(form);
+      setRedirecionandoParaCheckout(true);
+      window.location.href = checkout_url;
     } catch {
-      // erro já fica exposto via useAuth().erro
+      // erro já fica exposto via useAuth().erro (inclui Stripe não configurado);
+      // a conta já foi criada e pode ser retomada depois via login + /assinatura.
     }
   }
 
@@ -73,7 +57,7 @@ export default function SignupPage() {
           </span>
           <div>
             <h1 className="text-lg font-semibold text-neutral-900 dark:text-neutral-50">Crie sua conta</h1>
-            <p className="text-sm text-neutral-500">14 dias grátis, sem cartão de crédito.</p>
+            <p className="text-sm text-neutral-500">Você será direcionado para o pagamento em seguida.</p>
           </div>
         </div>
 

@@ -2,11 +2,13 @@
 Endpoints da API, protegidos por JWT + RBAC (SUPER_ADMIN vs ADMIN vs USER).
 
 Fluxo de autenticação:
-1. Login em POST /api/auth/login (mesma tela/endpoint para os três papéis) ou
-   autocadastro público em POST /api/auth/signup (cria a Empresa + o primeiro
-   usuário ADMIN dela, já com login automático). O JWT emitido carrega
-   `usuario_id`, `empresa_id` e `role`; a resposta também devolve esses dados
-   "abertos" para o frontend decidir o redirecionamento sem decodificar o token.
+1. Login em POST /api/auth/login (mesma tela/endpoint para os três papéis)
+   emite o JWT de sessão. O autocadastro público em POST /api/auth/signup cria
+   a Empresa + o primeiro usuário ADMIN dela, mas SEM login automático — a
+   empresa nasce com status `pending_payment` e a resposta só devolve a URL do
+   Stripe Checkout (ver routes.signup). O JWT do login carrega `usuario_id`,
+   `empresa_id` e `role`; a resposta também devolve esses dados "abertos" para
+   o frontend decidir o redirecionamento sem decodificar o token.
 2. Toda rota protegida depende de `get_current_usuario` (valida o JWT) e,
    quando a ação é restrita, de `require_roles(...)` (valida o papel).
 3. SUPER_ADMIN enxerga e gerencia qualquer empresa/câmera/zona, e nunca é
@@ -14,8 +16,8 @@ Fluxo de autenticação:
    enxergam a própria empresa e têm CRUD completo das câmeras/zonas dela —
    isolamento garantido no backend (nunca apenas no frontend). Rotas de
    negócio (câmeras, zonas, streaming, métricas, relatórios) exigem também
-   `garantir_assinatura_ativa` (bloqueia com 403 se a empresa não estiver em
-   trial nem com assinatura ativa).
+   `garantir_assinatura_ativa` (bloqueia com 403 se a empresa não estiver com
+   assinatura ativa — inclui contas recém-cadastradas em `pending_payment`).
 """
 import json
 from collections import defaultdict
@@ -90,19 +92,27 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
 
 @router.post(
     "/api/auth/signup",
-    response_model=schemas.Token,
+    response_model=schemas.SignupResponse,
     status_code=status.HTTP_201_CREATED,
     tags=["auth"],
 )
 def signup(payload: schemas.SignupRequest, db: Session = Depends(get_db)):
     """
-    Autocadastro público: cria a Empresa (em trial por TRIAL_DIAS dias) e seu
-    primeiro usuário (ADMIN), com login automático — sem passar pelo Stripe
-    (a cobrança acontece depois, via POST /api/payments/create-checkout-session).
-    """
-    from config import TRIAL_DIAS
-    from datetime import timedelta
+    Autocadastro público: cria a Empresa (status `pending_payment` — nenhum
+    acesso liberado, ver auth.garantir_assinatura_ativa) e seu primeiro
+    usuário (ADMIN). SEM login automático: não emitimos JWT aqui de propósito,
+    para não existir sessão válida antes do pagamento. A resposta só devolve a
+    URL do Stripe Checkout, para onde o frontend redireciona imediatamente —
+    a empresa só sai de `pending_payment` quando o webhook confirma o
+    pagamento (ver payments.processar_evento_webhook, evento
+    checkout.session.completed).
 
+    Se a Stripe não estiver configurada (503), a conta já criada não é
+    desfeita: o admin consegue logar normalmente depois (POST /api/auth/login,
+    sem checagem de assinatura) e retomar o checkout em /assinatura assim que
+    a Stripe for configurada — só as rotas de negócio continuam bloqueadas
+    até lá.
+    """
     email = _normalizar_email(payload.email)
     existente = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     if existente:
@@ -110,8 +120,7 @@ def signup(payload: schemas.SignupRequest, db: Session = Depends(get_db)):
 
     empresa = models.Empresa(
         nome_empresa=payload.nome_empresa,
-        status_assinatura=models.StatusAssinatura.trial,
-        data_fim_periodo=datetime.utcnow() + timedelta(days=TRIAL_DIAS),
+        status_assinatura=models.StatusAssinatura.pending_payment,
     )
     db.add(empresa)
     db.flush()  # garante empresa.id antes de criar o usuário
@@ -130,7 +139,14 @@ def signup(payload: schemas.SignupRequest, db: Session = Depends(get_db)):
 
     emails.enviar_email_boas_vindas(usuario.email, usuario.nome, empresa)
 
-    return _token_response(usuario)
+    try:
+        checkout_url = payments.criar_checkout_session(
+            db, empresa, models.PlanoAssinatura.completo, usuario.email
+        )
+    except payments.StripeNaoConfigurado as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+
+    return schemas.SignupResponse(empresa_id=empresa.id, checkout_url=checkout_url)
 
 
 # ==============================================================================

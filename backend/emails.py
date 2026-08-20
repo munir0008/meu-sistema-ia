@@ -87,15 +87,23 @@ def _enviar(destinatario: str, assunto: str, html: str) -> bool:
 
 
 def enviar_email_boas_vindas(destinatario: str, nome_admin: Optional[str], empresa: "models.Empresa") -> bool:
-    """Disparado logo após o autocadastro em POST /api/auth/signup."""
+    """
+    Disparado logo após o autocadastro em POST /api/auth/signup — nesse ponto
+    a conta ainda está com status `pending_payment` (o frontend já redirecionou
+    o navegador para o Stripe Checkout nesse meio-tempo). O link deste e-mail
+    aponta para /login, não /dashboard: não existe sessão automática após o
+    cadastro, e as rotas de negócio continuam bloqueadas até o pagamento ser
+    confirmado (ver auth.garantir_assinatura_ativa).
+    """
     saudacao = f"Olá, {nome_admin}!" if nome_admin else "Olá!"
     corpo = f"""
       <p>{saudacao}</p>
       <p>A conta da <strong>{empresa.nome_empresa}</strong> foi criada com sucesso na VisionSaaS.
-      Você já pode cadastrar suas câmeras e começar a monitorar — seu teste grátis de 14 dias
-      já está ativo, sem necessidade de cartão de crédito.</p>
+      Para ativar o acesso e começar a monitorar suas câmeras, finalize o pagamento da assinatura
+      pelo link que abrimos para você no checkout. Se fechou a página antes de concluir, é só
+      entrar na sua conta abaixo — a gente leva você direto para retomar o pagamento.</p>
     """
-    html = _layout_email("Bem-vindo(a) à VisionSaaS 🎥", corpo, "Acessar o painel", f"{FRONTEND_URL}/dashboard")
+    html = _layout_email("Bem-vindo(a) à VisionSaaS 🎥", corpo, "Entrar na minha conta", f"{FRONTEND_URL}/login")
     return _enviar(destinatario, "Bem-vindo(a) à VisionSaaS", html)
 
 

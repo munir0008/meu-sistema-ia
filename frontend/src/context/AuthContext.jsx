@@ -74,15 +74,17 @@ export function AuthProvider({ children }) {
     }
   }
 
+  /**
+   * POST /api/auth/signup: cria a empresa + o admin, mas SEM login automático
+   * (a conta nasce com pagamento pendente — ver backend/routes.signup) — não
+   * persiste sessão nem atualiza `user`, só devolve `{ empresa_id, checkout_url }`
+   * pra quem chamou (SignupPage) redirecionar para o Stripe Checkout.
+   */
   async function registrar(dadosCadastro) {
     setCarregando(true);
     setErro(null);
     try {
-      const resposta = await authApi.signup(dadosCadastro);
-      persistirSessao(resposta);
-      const novoUsuario = respostaParaUsuario(resposta);
-      setUser(novoUsuario);
-      return novoUsuario;
+      return await authApi.signup(dadosCadastro);
     } catch (err) {
       const detalhe = err?.response?.data?.detail || "Não foi possível criar a conta. Tente novamente.";
       setErro(detalhe);

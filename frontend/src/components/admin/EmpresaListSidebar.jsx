@@ -13,7 +13,7 @@ export default function EmpresaListSidebar({ empresas, empresaSelecionadaId, onS
       <div className="flex flex-col gap-1.5 overflow-y-auto lg:max-h-[calc(100vh-200px)]">
         {empresas.map((empresa) => {
           const ativa = empresa.id === empresaSelecionadaId;
-          const status = STATUS_ASSINATURA[empresa.status_assinatura] || STATUS_ASSINATURA.trial;
+          const status = STATUS_ASSINATURA[empresa.status_assinatura] || STATUS_ASSINATURA.pending_payment;
           return (
             <button
               key={empresa.id}

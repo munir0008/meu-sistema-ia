@@ -135,15 +135,18 @@ def is_super_admin(usuario: models.Usuario) -> bool:
     return usuario.role == models.RoleUsuario.super_admin
 
 
-_ASSINATURAS_VALIDAS = (models.StatusAssinatura.trial, models.StatusAssinatura.active)
+_ASSINATURAS_VALIDAS = (models.StatusAssinatura.active,)
 
 
 def garantir_assinatura_ativa(usuario: "models.Usuario") -> None:
     """
     Bloqueia o acesso a rotas de negócio (câmeras, zonas, streaming, métricas,
-    relatórios) quando a empresa do usuário não está em trial nem com a
-    assinatura ativa. SUPER_ADMIN nunca é bloqueado (é uma conta global, sem
-    empresa/assinatura).
+    relatórios) quando a empresa do usuário não está com a assinatura ativa —
+    isso cobre tanto quem nunca pagou (`pending_payment`, o estado inicial de
+    todo cadastro novo) quanto quem pagou e teve o pagamento falhar/cancelar
+    depois (`past_due`/`canceled`/`unpaid`) e contas antigas de antes do
+    pagamento obrigatório (`trial`, legado — ver models.StatusAssinatura).
+    SUPER_ADMIN nunca é bloqueado (é uma conta global, sem empresa/assinatura).
 
     O `detail` é um objeto (não uma string) de propósito: o frontend usa
     `detail.code` para diferenciar esse 403 de qualquer outro e redirecionar

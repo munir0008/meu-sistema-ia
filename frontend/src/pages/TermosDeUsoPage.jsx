@@ -28,8 +28,8 @@ export default function TermosDeUsoPage() {
 
       <h2>3. Assinatura e pagamento</h2>
       <ul>
-        <li>Novas contas recebem um período de teste gratuito (trial), sem necessidade de cartão de crédito.</li>
-        <li>Após o trial, o acesso às funcionalidades da Plataforma requer uma assinatura paga, processada por nosso parceiro de pagamentos (Stripe).</li>
+        <li>O acesso às funcionalidades da Plataforma requer uma assinatura paga desde o cadastro, processada por nosso parceiro de pagamentos (Stripe) — não há período de teste gratuito.</li>
+        <li>A conta só é ativada após a confirmação do pagamento; até lá, o acesso às funcionalidades permanece bloqueado.</li>
         <li>A assinatura é recorrente (mensal) e renovada automaticamente até o cancelamento.</li>
         <li>Você pode cancelar a qualquer momento pelo Portal do Cliente, sem multa — o acesso permanece até o fim do período já pago.</li>
         <li>Em caso de falha de pagamento, o acesso às funcionalidades pode ser suspenso até a regularização.</li>

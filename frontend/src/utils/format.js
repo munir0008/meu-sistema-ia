@@ -65,7 +65,11 @@ export const TIPO_ZONA_CORES = {
 
 /** Rótulo e cor (tone do <Badge>) de cada status_assinatura da empresa. */
 export const STATUS_ASSINATURA = {
-  trial: { label: "Em teste", tone: "cyan" },
+  // Legado: cadastros de antes do pagamento virar obrigatório — não têm mais
+  // acesso liberado (ver backend/auth.garantir_assinatura_ativa), daí o tone
+  // vermelho apesar do rótulo antigo.
+  trial: { label: "Bloqueada (trial legado)", tone: "red" },
+  pending_payment: { label: "Pagamento pendente", tone: "amber" },
   active: { label: "Ativa", tone: "green" },
   past_due: { label: "Inadimplente", tone: "amber" },
   canceled: { label: "Cancelada", tone: "red" },

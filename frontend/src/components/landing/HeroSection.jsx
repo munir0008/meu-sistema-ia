@@ -26,7 +26,7 @@ export default function HeroSection() {
         <div className="mt-2 flex flex-col gap-3 sm:flex-row">
           <Link to="/registrar">
             <Button size="md" icon={ArrowRight} className="px-6">
-              Começar Agora — 14 dias grátis
+              Começar Agora
             </Button>
           </Link>
           <a href="#precos">
@@ -35,7 +35,7 @@ export default function HeroSection() {
             </Button>
           </a>
         </div>
-        <p className="text-xs text-neutral-500">Sem cartão de crédito para começar o teste.</p>
+        <p className="text-xs text-neutral-500">Assinatura mensal, cancele quando quiser.</p>
       </div>
     </section>
   );

@@ -29,8 +29,6 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: "3.11.9"
-      - key: TRIAL_DIAS
-        value: "14"
       # Preencha manualmente no Dashboard do Render (Environment) após o primeiro deploy —
       # `sync: false` = "não gerar, não commitar no blueprint, eu preencho depois".
       - key: SUPER_ADMIN_EMAIL

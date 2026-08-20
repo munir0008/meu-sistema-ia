@@ -4,8 +4,9 @@ import Button from "../ui/Button";
 
 /**
  * Card do plano único da plataforma — reutilizado na Landing Page (visitante
- * escolhe o plano e é mandado para `/registrar?plano=...`) e na página
- * `/assinatura` (empresa já logada, o botão dispara o Stripe Checkout direto).
+ * é mandado para `/registrar`, que já cria a conta e redireciona pro Stripe
+ * Checkout) e na página `/assinatura` (empresa já logada, o botão dispara o
+ * Stripe Checkout direto).
  *
  * `carregandoChave`: chave do plano com ação em andamento (mostra spinner só
  * nesse botão). `textoBotao(plano)`: permite customizar o rótulo por contexto.
@@ -20,7 +21,7 @@ export default function PricingSection({ onSelecionar, carregandoChave = null, t
           Um plano só, sem letra miúda
         </h2>
         <p className="mt-3 text-sm text-neutral-600 sm:text-base dark:text-neutral-400">
-          Comece grátis por 14 dias. Cancele quando quiser, sem multa.
+          Assine em minutos. Cancele quando quiser, sem multa.
         </p>
       </div>
 
