@@ -835,10 +835,10 @@ def customer_portal(
     if not empresa:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Empresa não encontrada")
     try:
-        url = payments.criar_portal_session(empresa)
+        portal_url, checkout_url = payments.criar_portal_ou_checkout_session(db, empresa, atual.email)
     except payments.StripeNaoConfigurado as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
-    return schemas.CustomerPortalOut(portal_url=url)
+    return schemas.CustomerPortalOut(portal_url=portal_url, checkout_url=checkout_url)
 
 
 @router.post("/api/webhooks/stripe", tags=["payments"], include_in_schema=False)

@@ -174,7 +174,11 @@ class CheckoutSessionOut(BaseModel):
 
 
 class CustomerPortalOut(BaseModel):
-    portal_url: str
+    # Preenche exatamente um dos dois: portal_url quando a empresa já tem
+    # assinatura Stripe, checkout_url quando cai no fallback de 1º pagamento
+    # (ver payments.criar_portal_ou_checkout_session).
+    portal_url: Optional[str] = None
+    checkout_url: Optional[str] = None
 
 
 # ---------- Métricas / Dashboard ----------

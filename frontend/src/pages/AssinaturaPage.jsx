@@ -60,10 +60,14 @@ export default function AssinaturaPage() {
     setAcaoCarregando("portal");
     setErro(null);
     try {
-      const portalUrl = await paymentsApi.abrirPortalCliente();
-      window.location.href = portalUrl;
+      const { portal_url: portalUrl, checkout_url: checkoutUrl } = await paymentsApi.abrirPortalCliente();
+      const destino = portalUrl || checkoutUrl;
+      if (!destino) throw new Error("resposta sem URL");
+      // Sem stripe_customer_id válido, o backend devolve checkout_url em vez
+      // de portal_url — redireciona do mesmo jeito, direto pro 1º pagamento.
+      window.location.href = destino;
     } catch (err) {
-      setErro(err?.response?.data?.detail || "Não foi possível abrir o portal de assinatura.");
+      setErro(err?.response?.data?.detail || "Não foi possível abrir o portal de assinatura. Tente novamente em instantes.");
       setAcaoCarregando(null);
     }
   }
