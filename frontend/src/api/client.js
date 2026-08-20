@@ -9,7 +9,29 @@ import axios from "axios";
 // ".env.example") para não cair nesse fallback de produção sem querer.
 const API_URL_FALLBACK_PRODUCAO = "https://visionsaas-backend.onrender.com";
 
-export const API_URL = import.meta.env.VITE_API_URL || API_URL_FALLBACK_PRODUCAO;
+// A env var pode estar DEFINIDA porém com um valor inválido (ex.: colada de um
+// texto/markdown como "[https://...](https://...)", ou com espaços/aspas
+// sobrando) — nesse caso "VITE_API_URL || fallback" não pega o problema, pois
+// a string não está vazia. Validamos que é uma URL http(s) de verdade antes de
+// aceitar; qualquer coisa fora disso cai no mesmo fallback de produção acima.
+function resolverApiUrl(valorBruto) {
+  const valor = (valorBruto ?? "").trim();
+  if (!valor) return API_URL_FALLBACK_PRODUCAO;
+  try {
+    const url = new URL(valor);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error("esquema não é http/https");
+    }
+  } catch {
+    console.error(
+      `[api] VITE_API_URL inválida ("${valor}") — usando fallback de produção (${API_URL_FALLBACK_PRODUCAO}).`
+    );
+    return API_URL_FALLBACK_PRODUCAO;
+  }
+  return valor;
+}
+
+export const API_URL = resolverApiUrl(import.meta.env.VITE_API_URL);
 
 export const TOKEN_STORAGE_KEY = "vision_saas_token";
 // Nome da empresa não vem no JWT (não é usado para autorização) — guardado à parte
