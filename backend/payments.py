@@ -98,16 +98,37 @@ def criar_checkout_session(db: Session, empresa: "models.Empresa", plano: "model
     return session.url
 
 
-def criar_portal_session(empresa: "models.Empresa") -> str:
-    _exigir_configurado()
-    if not empresa.stripe_customer_id:
-        raise StripeNaoConfigurado("Esta empresa ainda não tem uma assinatura Stripe iniciada.")
+def criar_portal_ou_checkout_session(
+    db: Session, empresa: "models.Empresa", email_admin: str
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Gera a URL do Customer Portal para a empresa gerenciar a assinatura
+    existente. Se ela ainda não tiver um `stripe_customer_id` válido — nunca
+    chegou a pagar, ou o customer salvo não existe mais na Stripe (ambiente
+    de chaves trocado, customer removido no Dashboard etc.) — não estoura
+    erro: cai para uma nova Checkout Session do plano único, para o ADMIN
+    poder fazer o primeiro pagamento em vez de ver "portal indisponível".
 
-    session = stripe.billing_portal.Session.create(
-        customer=empresa.stripe_customer_id,
-        return_url=f"{FRONTEND_URL}/assinatura",
-    )
-    return session.url
+    Retorna (portal_url, checkout_url) — sempre exatamente um dos dois vem
+    preenchido; o outro fica None.
+    """
+    _exigir_configurado()
+
+    if empresa.stripe_customer_id:
+        try:
+            session = stripe.billing_portal.Session.create(
+                customer=empresa.stripe_customer_id,
+                return_url=f"{FRONTEND_URL}/assinatura",
+            )
+            return session.url, None
+        except stripe.error.InvalidRequestError:
+            # customer_id salvo não existe mais nessa conta/ambiente Stripe —
+            # trata como se a empresa nunca tivesse um customer.
+            empresa.stripe_customer_id = None
+
+    plano = empresa.plano_atual or models.PlanoAssinatura.completo
+    checkout_url = criar_checkout_session(db, empresa, plano, email_admin)
+    return None, checkout_url
 
 
 def construir_evento_webhook(payload: bytes, assinatura: Optional[str]) -> "stripe.Event":
