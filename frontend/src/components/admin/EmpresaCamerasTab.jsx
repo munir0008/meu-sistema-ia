@@ -179,7 +179,7 @@ export default function EmpresaCamerasTab({ empresaId }) {
                     <>
                       <ErrorBanner className="mb-3">{erroZonas}</ErrorBanner>
                       <ZoneEditor
-                        cameraId={camera.id}
+                        camera={camera}
                         zonas={zonasPorCamera[camera.id]}
                         onChangeZonas={(novas) => atualizarZonasLocal(camera.id, novas)}
                       />

@@ -164,6 +164,64 @@ class CameraStream:
             self._cap.release()
 
 
+# Valor de `Camera.rtsp_url` que sinaliza "esta câmera não é aberta pelo
+# backend via OpenCV — os frames chegam por push do NAVEGADOR do usuário, via
+# WebSocket" (ver BrowserPushStream e routes.camera_ingest). Necessário porque
+# um backend rodando num servidor remoto (ex.: Render) não tem acesso a
+# NENHUMA webcam local: quem tem a câmera de verdade é o navegador de quem
+# está com o notebook/PC na mão, então é ele quem precisa capturar e enviar.
+FONTE_WEBCAM_NAVEGADOR = "browser"
+
+
+class BrowserPushStream:
+    """
+    Fonte de frames alimentada por PUSH externo (via WebSocket), em vez de aberta
+    pelo próprio backend via OpenCV como o CameraStream. Usada quando
+    `Camera.rtsp_url == FONTE_WEBCAM_NAVEGADOR`: o navegador do usuário captura a
+    própria webcam (getUserMedia) e envia os frames prontos (JPEG) pra cá — ver
+    routes.camera_ingest, que decodifica e chama `push_frame`.
+
+    Implementa a mesma interface pública que VideoProcessor espera de
+    CameraStream (start/read/connected/stop), então o resto do pipeline
+    (detecção, zonas, blur, streaming de saída) não precisa saber a diferença
+    entre as duas fontes.
+    """
+
+    def __init__(self, timeout_sem_frame: Optional[float] = None):
+        self._timeout_sem_frame = timeout_sem_frame or config.CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS
+        self._frame: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
+        self._ultimo_frame_recebido_em = 0.0
+
+    def start(self) -> "BrowserPushStream":
+        return self  # nada a abrir aqui — os frames chegam via push_frame()
+
+    def push_frame(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+            self._ultimo_frame_recebido_em = time.monotonic()
+
+    def _frame_fresco(self) -> bool:
+        return self._frame is not None and (time.monotonic() - self._ultimo_frame_recebido_em) < self._timeout_sem_frame
+
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            return self._frame_fresco()
+
+    def read(self) -> Optional[np.ndarray]:
+        # Some (não devolve o último frame indefinidamente) depois de
+        # CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS sem push novo — do contrário o
+        # feed pareceria "ao vivo" pra sempre com um frame congelado, mesmo com a
+        # aba do navegador que captura já fechada há minutos.
+        with self._lock:
+            return self._frame.copy() if self._frame_fresco() else None
+
+    def stop(self) -> None:
+        with self._lock:
+            self._frame = None
+
+
 # ----------------------------------------------------------------------------
 # Zonas geométricas
 # ----------------------------------------------------------------------------
@@ -257,7 +315,10 @@ class VideoProcessor:
         self.zonas = zonas
         self.session_factory = session_factory
 
-        self.stream = CameraStream(source).start()
+        if str(source).strip().lower() == FONTE_WEBCAM_NAVEGADOR:
+            self.stream = BrowserPushStream().start()
+        else:
+            self.stream = CameraStream(source).start()
 
         # Modelo e detector facial são carregados sob demanda, DENTRO da thread de
         # processamento (evita bloquear quem chamou CameraManager.get_or_create).

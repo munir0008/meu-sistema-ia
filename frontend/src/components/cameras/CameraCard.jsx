@@ -3,6 +3,7 @@ import { useState } from "react";
 import { getVideoFeedUrl } from "../../api/cameras";
 import Badge from "../ui/Badge";
 import { PERFIL_CAMERA_LABELS } from "../../utils/format";
+import WebcamCapturePusher from "./WebcamCapturePusher";
 
 export default function CameraCard({ camera }) {
   const [streamKey, setStreamKey] = useState(0);
@@ -71,6 +72,8 @@ export default function CameraCard({ camera }) {
         </div>
         <Badge tone="cyan">Câmera #{camera.id}</Badge>
       </div>
+
+      <WebcamCapturePusher camera={camera} />
     </div>
   );
 }

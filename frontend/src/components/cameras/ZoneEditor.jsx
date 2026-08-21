@@ -4,14 +4,21 @@ import { getVideoFeedUrl } from "../../api/cameras";
 import Button from "../ui/Button";
 import Select from "../ui/Select";
 import { TIPO_ZONA_CORES, TIPO_ZONA_LABELS } from "../../utils/format";
+import WebcamCapturePusher from "./WebcamCapturePusher";
 
 /**
  * Editor de zonas de interesse: desenha polígonos normalizados (0.0–1.0) sobre
  * o frame ao vivo da câmera. Clique adiciona vértices; "Finalizar zona" fecha o
  * polígono atual. O array `zonas` resultante já está no formato esperado pelo
  * backend (POST /api/admin/cameras/{id}/zonas).
+ *
+ * Recebe a câmera inteira (não só o id) porque, se for uma câmera de webcam do
+ * navegador (rtsp_url === "browser"), esta própria página precisa capturar e
+ * enviar os frames (ver WebcamCapturePusher) — do contrário não haveria
+ * nenhuma imagem de referência aqui para desenhar as zonas em cima.
  */
-export default function ZoneEditor({ cameraId, zonas, onChangeZonas }) {
+export default function ZoneEditor({ camera, zonas, onChangeZonas }) {
+  const cameraId = camera.id;
   const containerRef = useRef(null);
   const [tipoSelecionado, setTipoSelecionado] = useState("atendente");
   const [pontosAtuais, setPontosAtuais] = useState([]);
@@ -65,6 +72,8 @@ export default function ZoneEditor({ cameraId, zonas, onChangeZonas }) {
         Clique sobre a imagem para posicionar cada vértice do polígono (mínimo 3 pontos) e depois em
         &quot;Finalizar zona&quot;.
       </p>
+
+      <WebcamCapturePusher camera={camera} />
 
       <div
         ref={containerRef}

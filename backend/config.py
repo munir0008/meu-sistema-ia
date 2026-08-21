@@ -119,6 +119,14 @@ BLUR_KERNEL = int(os.getenv("BLUR_KERNEL", "51"))  # precisa ser ímpar
 # ver CameraStream._update_loop).
 CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS = float(os.getenv("CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS", "20"))
 
+# Por quantos segundos sem receber um frame novo via WebSocket (câmera com
+# rtsp_url == "browser", capturada no NAVEGADOR do usuário — ver
+# vision.BrowserPushStream e routes.camera_ingest) a fonte é considerada
+# desconectada. Cobre o caso da aba do navegador ser fechada sem o WebSocket
+# avisar limpo (ex.: queda de rede) — sem isso, o último frame recebido ficaria
+# "congelado" sendo servido pra sempre como se a câmera ainda estivesse ao vivo.
+CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS = float(os.getenv("CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS", "5"))
+
 # --- Regras de negócio por perfil de câmera (ajustáveis por variável de ambiente) ---
 
 # Balcão/Loja: tempo mínimo de presença conjunta (atendente + cliente) para validar

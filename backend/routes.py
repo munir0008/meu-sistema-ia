@@ -25,7 +25,19 @@ from collections import defaultdict
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+import cv2
+import numpy as np
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -37,6 +49,7 @@ import payments
 import reports
 import schemas
 from auth import (
+    _resolve_usuario_from_token,
     criar_token_para_usuario,
     garantir_assinatura_ativa,
     get_current_usuario,
@@ -46,7 +59,7 @@ from auth import (
     verify_password,
 )
 from database import SessionLocal, get_db
-from vision import camera_manager
+from vision import FONTE_WEBCAM_NAVEGADOR, BrowserPushStream, camera_manager
 
 router = APIRouter()
 logger = logging.getLogger("routes")
@@ -625,6 +638,83 @@ def video_feed(
         processador.generate_mjpeg(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+# Tamanho máximo aceito por frame recebido via WebSocket em camera_ingest — um
+# JPEG 640x480 de qualidade normal fica na casa de dezenas de KB; alguns MB já é
+# folga generosa. Descarta silenciosamente qualquer coisa maior em vez de deixar
+# um payload gigante ser decodificado (a rota já exige JWT + assinatura ativa +
+# posse da câmera, então isso é defesa em profundidade, não a barreira principal).
+_CAMERA_INGEST_MAX_FRAME_BYTES = 4 * 1024 * 1024
+
+
+@router.websocket("/api/camera_ingest/{camera_id}")
+async def camera_ingest(websocket: WebSocket, camera_id: int):
+    """
+    Contrapartida de ENTRADA do /api/video_feed (que é a saída, já processada):
+    recebe, via WebSocket, os frames JPEG que o NAVEGADOR do usuário capturou da
+    própria webcam (getUserMedia) e empurra pro VideoProcessor desta câmera — ver
+    vision.BrowserPushStream. Só existe porque, com o backend rodando num
+    servidor remoto (Render), NENHUMA webcam local do usuário é alcançável por
+    `cv2.VideoCapture`; quem tem acesso de verdade à câmera é o navegador de
+    quem está com o notebook na mão, então é ele quem precisa mandar os frames
+    pra cá — o resto do pipeline (YOLO, zonas, blur, streaming de saída) não
+    muda nada, só a origem do frame.
+
+    Autenticação via `?token=` (mesma razão do get_current_usuario_stream: não
+    dá pra mandar um header Authorization ao abrir um WebSocket do navegador com
+    o construtor nativo `new WebSocket(url)`). Feita manualmente aqui (em vez de
+    `Depends`) para controlar explicitamente o fechamento da conexão em cada
+    falha, sem depender de como cada versão do FastAPI traduz uma HTTPException
+    levantada dentro de uma dependency de rota WebSocket.
+    """
+    token = websocket.query_params.get("token")
+    db = SessionLocal()
+    try:
+        try:
+            atual = _resolve_usuario_from_token(token, db)
+            garantir_assinatura_ativa(atual)
+            camera = _obter_camera_acessivel(db, camera_id, atual)
+        except HTTPException as exc:
+            logger.warning("[camera %s] camera_ingest recusado: %s", camera_id, exc.detail)
+            await websocket.close(code=4401)
+            return
+
+        if (camera.rtsp_url or "").strip().lower() != FONTE_WEBCAM_NAVEGADOR:
+            logger.warning(
+                "[camera %s] camera_ingest recusado: rtsp_url não é \"%s\" (é %r).",
+                camera_id, FONTE_WEBCAM_NAVEGADOR, camera.rtsp_url,
+            )
+            await websocket.close(code=4400)
+            return
+
+        zonas = db.query(models.Zona).filter(models.Zona.camera_id == camera.id).all()
+        processador = camera_manager.get_or_create(camera, zonas, SessionLocal)
+    finally:
+        db.close()
+
+    if not isinstance(processador.stream, BrowserPushStream):
+        # Só acontece se a câmera foi trocada de RTSP/webcam-local pra "browser"
+        # sem o processor antigo ser reciclado (atualizar_camera já chama
+        # camera_manager.stop() quando rtsp_url muda — ver routes.py — então isso
+        # não deveria ocorrer em uso normal; é rede de segurança).
+        logger.error("[camera %s] camera_ingest: processor ativo não é BrowserPushStream.", camera_id)
+        await websocket.close(code=4409)
+        return
+
+    await websocket.accept()
+    logger.info("[camera %s] navegador conectado em camera_ingest — recebendo frames.", camera_id)
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            if len(data) > _CAMERA_INGEST_MAX_FRAME_BYTES:
+                logger.warning("[camera %s] frame recebido (%d bytes) excede o limite — descartado.", camera_id, len(data))
+                continue
+            frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                processador.stream.push_frame(frame)
+    except WebSocketDisconnect:
+        logger.info("[camera %s] navegador desconectou de camera_ingest.", camera_id)
 
 
 # ==============================================================================
