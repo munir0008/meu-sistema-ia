@@ -34,7 +34,9 @@ gravados nas tabelas metricas_atendimento / metricas_ocupacao.
 """
 from __future__ import annotations
 
+import logging
 import math
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -46,6 +48,8 @@ import numpy as np
 
 import config
 import models
+
+logger = logging.getLogger("vision")
 
 Pessoa = Tuple[int, Optional[int], Tuple[int, int, int, int]]  # (classe, track_id, box)
 Centro = Tuple[float, float, float, float]  # (cx_pixel, cy_pixel, cx_normalizado, cy_normalizado)
@@ -82,11 +86,36 @@ class CameraStream:
         return self
 
     def _open_capture(self) -> None:
-        # CAP_FFMPEG lida bem com RTSP; para webcam local o backend padrão é usado.
-        backend = cv2.CAP_FFMPEG if isinstance(self.source, str) else cv2.CAP_ANY
+        # CAP_FFMPEG lida bem com RTSP. Para webcam local no Windows, CAP_ANY cai no
+        # backend MSMF, que é instável para leitura contínua em thread própria (trava
+        # com "can't grab frame. Error: -1072873821" e o stream fica vazio para
+        # sempre) — CAP_DSHOW é o backend confiável para esse caso nesta plataforma.
+        if isinstance(self.source, str):
+            backend = cv2.CAP_FFMPEG
+        elif sys.platform == "win32":
+            backend = cv2.CAP_DSHOW
+        else:
+            backend = cv2.CAP_ANY
         self._cap = cv2.VideoCapture(self.source, backend)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.connected = self._cap.isOpened()
+        if self.connected:
+            logger.info("[camera source=%s] cap.isOpened()=True — captura aberta com sucesso.", self.source)
+        else:
+            # Causa mais comum em produção: `source` é um índice de webcam local
+            # ("0", "1", ...) mas o processo do backend está rodando num servidor
+            # remoto (ex.: Render) sem NENHUM dispositivo de câmera físico — não hà
+            # webcam para o OpenCV abrir aí, então isso vai falhar sempre, não é
+            # intermitente. Para RTSP, normalmente é URL/credencial/porta erradas ou
+            # a câmera fora da mesma rede que o servidor consegue alcançar.
+            logger.warning(
+                "[camera source=%s] cap.isOpened()=False — não foi possível abrir a fonte de vídeo. "
+                "Se `source` é um índice de webcam local (\"0\", \"1\"...), confirme que o processo do "
+                "backend está rodando na MESMA máquina que tem a câmera — um servidor remoto (Render, "
+                "por ex.) não enxerga webcam nenhuma. Se é RTSP, confirme URL/credenciais e que o "
+                "servidor tem rota de rede até a câmera.",
+                self.source,
+            )
 
     def _update_loop(self) -> None:
         falhas_consecutivas = 0
@@ -100,15 +129,24 @@ class CameraStream:
             ok, frame = self._cap.read()
             if not ok:
                 falhas_consecutivas += 1
+                estava_conectado = self.connected
                 self.connected = False
+                if estava_conectado:
+                    logger.warning("[camera source=%s] cap.read() passou a falhar (ok=False) — sem frame novo.", self.source)
                 if falhas_consecutivas > 10:
                     # Tenta reconectar (comum em RTSP instável)
+                    logger.warning(
+                        "[camera source=%s] %d falhas de leitura consecutivas — reabrindo a captura.",
+                        self.source, falhas_consecutivas,
+                    )
                     self._cap.release()
                     time.sleep(1.5)
                     self._open_capture()
                     falhas_consecutivas = 0
                 continue
 
+            if not self.connected:
+                logger.info("[camera source=%s] voltou a ler frames com sucesso.", self.source)
             falhas_consecutivas = 0
             self.connected = True
             with self._lock:
@@ -262,6 +300,12 @@ class VideoProcessor:
         # --- Buffer do frame já processado (o que os viewers HTTP consomem) ---
         self._frame_lock = threading.Lock()
         self._ultimo_jpeg: Optional[bytes] = None
+
+        # --- Status real da câmera (models.Camera.status), refletindo se a captura
+        # está de fato entregando frames — ver _atualizar_status_camera. None força a
+        # primeira persistência mesmo que `stream.connected` já nasça False (default
+        # da coluna já é "offline", mas queremos o log da primeira checagem mesmo assim).
+        self._ultimo_status_persistido: Optional[bool] = None
 
         self._rodando = True
         self._thread = threading.Thread(target=self._loop_processamento, daemon=True)
@@ -907,6 +951,31 @@ class VideoProcessor:
             "descartadas (evita durações infladas pela queda de conexão ao reconectar)"
         )
 
+    def _atualizar_status_camera(self, conectado: bool) -> None:
+        """
+        Mantém `models.Camera.status` refletindo se `CameraStream` está de fato
+        entregando frames — só grava no banco em TRANSIÇÕES (mesmo padrão dos
+        outros `_persistir_*`/`_salvar_*` deste módulo), não a cada frame. Antes
+        disso, a rota `/api/video_feed` marcava a câmera como "online" só por ter
+        sido requisitada, mesmo que a captura nunca tivesse conseguido abrir — daí
+        o dashboard mostrar "online"/tela preta ao mesmo tempo em produção quando a
+        fonte configurada (ex.: webcam local) não existe no servidor.
+        """
+        if self._ultimo_status_persistido is conectado:
+            return
+        self._ultimo_status_persistido = conectado
+        novo_status = models.StatusCamera.online if conectado else models.StatusCamera.offline
+
+        db = self.session_factory()
+        try:
+            camera = db.get(models.Camera, self.camera_id)
+            if camera is not None:
+                camera.status = novo_status
+                db.commit()
+        finally:
+            db.close()
+        logger.info("[camera %s] status -> %s", self.camera_id, novo_status.value)
+
     def _loop_processamento(self) -> None:
         """
         Roda em background, uma vez por câmera, independente de quantos viewers HTTP
@@ -916,6 +985,8 @@ class VideoProcessor:
         intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
         while self._rodando:
             inicio = time.monotonic()
+            self._atualizar_status_camera(self.stream.connected)
+
             frame = self.stream.read()
             if frame is None:
                 self._verificar_desconexao_prolongada(inicio)
@@ -929,7 +1000,11 @@ class VideoProcessor:
                 processado = self.processar_frame(frame)
             except Exception:
                 # Uma falha pontual (ex.: frame corrompido) não pode derrubar a
-                # thread de processamento da câmera — só pula esse frame.
+                # thread de processamento da câmera — só pula esse frame, mas loga
+                # com stack trace (antes era silencioso — uma falha recorrente aqui
+                # produzia exatamente o mesmo sintoma de "tela preta sem explicação"
+                # que a desconexão da câmera, sem nenhum log pra diferenciar as duas).
+                logger.exception("[camera %s] falha ao processar frame — pulando este frame.", self.camera_id)
                 continue
 
             ok, buffer = cv2.imencode(
@@ -946,15 +1021,35 @@ class VideoProcessor:
         """
         Consumidor puro (um por viewer HTTP): só lê o último JPEG já processado.
         Não roda IA — ver docstring do módulo sobre a thread de processamento dedicada.
+
+        Antes do PRIMEIRO frame, desiste depois de
+        CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS: sem isso, uma câmera cuja fonte
+        nunca conecta (webcam local inexistente no servidor, RTSP incorreto/
+        inalcançável) mantinha a resposta HTTP pendurada para sempre — 200 OK,
+        corpo vazio — e a <img> no navegador nunca disparava onError, então a
+        tela ficava preta sem nenhuma explicação. Encerrando o generator aqui, a
+        resposta fecha e o navegador dispara onError (ver CameraCard.jsx), que já
+        sabe mostrar "Falha ao conectar à câmera" + botão de retry. Depois do
+        primeiro frame, o timeout deixa de valer — reconexões subsequentes usam a
+        resiliência normal do CameraStream.
         """
         intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
+        inicio_espera = time.monotonic()
+        teve_frame = False
         while True:
             with self._frame_lock:
                 jpeg = self._ultimo_jpeg
             if jpeg is None:
+                if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
+                    logger.warning(
+                        "[camera %s] nenhum frame em %.0fs — encerrando o streaming deste viewer.",
+                        self.camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
+                    )
+                    return
                 time.sleep(0.1)
                 continue
 
+            teve_frame = True
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
             time.sleep(intervalo)
 

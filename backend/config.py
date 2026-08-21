@@ -109,6 +109,16 @@ STREAM_JPEG_QUALITY = int(os.getenv("STREAM_JPEG_QUALITY", "80"))
 STREAM_TARGET_FPS = int(os.getenv("STREAM_TARGET_FPS", "15"))
 BLUR_KERNEL = int(os.getenv("BLUR_KERNEL", "51"))  # precisa ser ímpar
 
+# Por quantos segundos um viewer HTTP (generate_mjpeg) espera pelo PRIMEIRO frame
+# antes de desistir e encerrar a resposta. Sem isso, uma câmera cuja fonte nunca
+# conecta (ex.: índice de webcam local inexistente no servidor, IP/porta RTSP
+# errados) faz o streaming ficar pendurado para sempre — 200 OK, corpo vazio,
+# sem nunca disparar o onError da <img> no navegador (tela fica preta sem
+# explicação nenhuma). Depois do primeiro frame recebido com sucesso, esse
+# timeout deixa de valer (perdas/reconexões subsequentes já são resilientes,
+# ver CameraStream._update_loop).
+CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS = float(os.getenv("CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS", "20"))
+
 # --- Regras de negócio por perfil de câmera (ajustáveis por variável de ambiente) ---
 
 # Balcão/Loja: tempo mínimo de presença conjunta (atendente + cliente) para validar

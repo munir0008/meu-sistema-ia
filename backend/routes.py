@@ -613,10 +613,13 @@ def video_feed(
     camera = _obter_camera_acessivel(db, camera_id, atual)
     zonas = db.query(models.Zona).filter(models.Zona.camera_id == camera.id).all()
 
+    # NÃO marcamos `camera.status = online` aqui: isso só significava "essa rota foi
+    # requisitada", não que a captura de fato conseguiu abrir/ler a câmera — uma fonte
+    # que nunca conecta (ex.: índice de webcam local num servidor sem câmera nenhuma)
+    # ainda aparecia como "online" no dashboard enquanto a tela ficava preta. O status
+    # real agora é mantido por VideoProcessor._atualizar_status_camera, refletindo se
+    # CameraStream está de fato entregando frames (ver vision.py).
     processador = camera_manager.get_or_create(camera, zonas, SessionLocal)
-
-    camera.status = models.StatusCamera.online
-    db.commit()
 
     return StreamingResponse(
         processador.generate_mjpeg(),

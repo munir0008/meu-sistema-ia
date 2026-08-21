@@ -61,6 +61,11 @@ export default function CameraFormModal({ open, onClose, onSubmit, cameraEmEdica
           onChange={(e) => setForm({ ...form, rtsp_url: e.target.value })}
           required
         />
+        <p className="-mt-2 text-xs text-neutral-500">
+          Webcam local ("0", "1"...) só funciona quando o backend roda na mesma máquina que a câmera
+          (ex.: <code>python run_app.py</code> local). Em produção (Render), o servidor não enxerga sua
+          webcam — use apenas uma URL RTSP de câmera IP acessível pela internet.
+        </p>
         <Select
           label="Perfil de análise"
           name="perfil_ativo"
