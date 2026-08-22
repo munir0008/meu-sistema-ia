@@ -116,13 +116,18 @@ BLUR_KERNEL = int(os.getenv("BLUR_KERNEL", "51"))  # precisa ser ímpar
 # sem nunca disparar o onError da <img> no navegador (tela fica preta sem
 # explicação nenhuma). Depois do primeiro frame recebido com sucesso, esse
 # timeout deixa de valer (perdas/reconexões subsequentes já são resilientes,
-# ver CameraStream._update_loop). 45s (não 20s) porque esse orçamento também
-# precisa cobrir o carregamento do modelo YOLO (import do ultralytics + pesos)
-# na primeira vez — medido em ~6s numa máquina razoável, mas em CPU
-# compartilhada/limitada (ex.: instância free/starter do Render) pode passar
-# disso, ainda mais somado a um cold start do próprio serviço. Ver
-# VideoProcessor._carregar_modelo, chamado em paralelo com a conexão da fonte.
-CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS = float(os.getenv("CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS", "45"))
+# ver CameraStream._update_loop). 90s porque esse orçamento também precisa
+# cobrir o carregamento do modelo YOLO (import do ultralytics + pesos) na
+# primeira vez — medido em produção (Render): ~31s SÓ o import, contra ~4-6s
+# numa máquina de dev razoável (quase 8x mais lento). 45s (tentativa anterior)
+# comprovadamente não bastava — visto nos logs do Render estourando o timeout
+# logo depois do modelo terminar de carregar, sem sobrar tempo pra primeira
+# inferência. `main._aquecer_yolo_em_background` reduz a INCIDÊNCIA disso
+# (aquece o import uma vez no boot do processo), mas esse timeout continua
+# sendo a rede de segurança pra quando o warmup ainda não terminou (ex.: logo
+# após um deploy) — ver VideoProcessor._carregar_modelo, chamado em paralelo
+# com a conexão da fonte.
+CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS = float(os.getenv("CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS", "90"))
 
 # Por quantos segundos sem receber um frame novo via WebSocket (câmera com
 # rtsp_url == "browser", capturada no NAVEGADOR do usuário — ver

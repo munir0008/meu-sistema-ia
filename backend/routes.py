@@ -518,7 +518,12 @@ def atualizar_camera(
 
     if payload.nome_camera is not None:
         camera.nome_camera = payload.nome_camera
-    if payload.rtsp_url is not None:
+    if payload.rtsp_url is not None and payload.rtsp_url != camera.rtsp_url:
+        # Só recicla o processor quando a fonte MUDOU de verdade — o formulário do
+        # frontend sempre manda `rtsp_url` no payload (mudando ou não), e reciclar à
+        # toa descarta um VideoProcessor já "quente" (modelo YOLO já carregado —
+        # import do ultralytics medido em ~30s em produção, ver config.py) só pra
+        # forçar outro carregamento do zero sem necessidade nenhuma.
         camera.rtsp_url = payload.rtsp_url
         camera_manager.stop(camera.id)  # força reconexão com a nova URL
     if payload.perfil_ativo is not None:

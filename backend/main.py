@@ -5,11 +5,13 @@ Executar com:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 import logging
+import threading
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import BACKEND_URL, CORS_ORIGINS
+from config import BACKEND_URL, CORS_ORIGINS, YOLO_MODEL_PATH
 from database import init_db, seed_super_admin
 from routes import router
 from vision import camera_manager
@@ -63,12 +65,42 @@ app.add_middleware(
 )
 
 
+def _aquecer_yolo_em_background() -> None:
+    """
+    Pré-aquece o import do `ultralytics`/torch — medido em produção (Render,
+    CPU compartilhada) em ~31s, contra ~4s numa máquina de dev razoável — UMA
+    VEZ no boot do processo, em vez de deixar a PRIMEIRA câmera que qualquer
+    usuário abrir pagar esse custo inteiro dentro do orçamento de
+    CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS do generate_mjpeg (foi exatamente
+    isso que causava viewer nunca receber frame nenhum e a tela ficar preta:
+    o modelo ainda estava carregando quando o timeout do streaming de saída
+    estourava). Cada câmera CONTINUA criando sua PRÓPRIA instância de YOLO em
+    VideoProcessor._carregar_modelo — necessário pra não misturar estado de
+    tracking entre câmeras (ver vision.py) — mas o import pesado do pacote
+    Python já estará "quente" (cacheado por sys.modules) quando isso
+    acontecer, então cada instância por câmera fica bem mais rápida depois
+    deste warmup. Roda em thread própria pra não atrasar o healthcheck do
+    Render (`GET /`) nem o restante do startup; falha aqui nunca derruba o
+    app — a primeira câmera real simplesmente paga o custo cheio de novo.
+    """
+    inicio = time.monotonic()
+    logger_warmup = logging.getLogger("main")
+    try:
+        from ultralytics import YOLO
+
+        YOLO(YOLO_MODEL_PATH)  # instância descartada — só para pagar o custo de import/inicialização
+        logger_warmup.info("Aquecimento do YOLO concluído em %.1fs.", time.monotonic() - inicio)
+    except Exception:
+        logger_warmup.exception("Aquecimento do YOLO falhou (não bloqueia o app — câmeras carregam o modelo normalmente sob demanda).")
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
     seed_super_admin()
     print(f"[stripe] Configure o webhook da assinatura para: {BACKEND_URL}/api/webhooks/stripe")
     print(f"[cors] Origens permitidas: {_origens_permitidas}")
+    threading.Thread(target=_aquecer_yolo_em_background, daemon=True).start()
 
 
 @app.on_event("shutdown")
