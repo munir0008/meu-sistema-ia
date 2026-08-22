@@ -14,7 +14,23 @@ services:
     rootDir: backend
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
+    # O segundo comando é necessário por causa de um conflito real de pacotes:
+    # `mediapipe` exige `opencv-contrib-python` e `ultralytics` exige
+    # `opencv-python` (ambos hard dependencies, confirmado via `pip show`) —
+    # então o `pip install` normal acaba instalando TRÊS distribuições de
+    # opencv (headless + python + contrib-python) no mesmo ambiente. As três
+    # escrevem pra dentro do mesmo pacote `cv2/`, então a que instalar por
+    # último "vence" e sobrescreve os arquivos das outras — de forma
+    # não-determinística (depende da ordem de resolução do pip). As variantes
+    # não-headless linkam contra bibliotecas gráficas do sistema (libGL etc.)
+    # que o runtime Python do Render não tem, então se uma delas "vencer" o
+    # `import cv2` pode falhar/travar bem no início — antes do uvicorn
+    # conseguir abrir a porta (sintoma observado: build OK, mas "Port scan
+    # timeout" no deploy). O `--force-reinstall --no-deps` garante que
+    # `opencv-python-headless` (a variante que o app realmente precisa, sem
+    # nenhuma dependência de biblioteca gráfica) seja sempre a versão final
+    # em disco, não importa a ordem de instalação anterior.
+    buildCommand: pip install -r requirements.txt && pip install --force-reinstall --no-deps "opencv-python-headless>=4.9.0.80"
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
     envVars:
