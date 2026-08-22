@@ -47,9 +47,20 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
   const ativo = camera && (camera.rtsp_url || "").trim().toLowerCase() === FONTE_WEBCAM_NAVEGADOR;
 
   useEffect(() => {
+    // Log de diagnóstico SEMPRE, mesmo quando `ativo` é false — se o resto da
+    // captura nunca aparece no console, é aqui que dá pra ver se o motivo é
+    // simplesmente esta câmera não estar marcada como "browser" (ex.: rtsp_url
+    // ainda "0"/RTSP manual) ou `camera` não ter chegado ainda.
+    console.log(
+      "[WebcamCapturePusher] montado — camera.id=%s rtsp_url=%o ativo=%s",
+      camera?.id, camera?.rtsp_url, ativo
+    );
     if (!ativo) return undefined;
     const video = videoRef.current; // capturado uma vez — evita ler .current de novo no cleanup (ref pode já ter mudado)
-    if (!video) return undefined;
+    if (!video) {
+      console.warn("[WebcamCapturePusher] ativo=true mas videoRef.current é null — <video> não montou a tempo?");
+      return undefined;
+    }
 
     let cancelado = false;
     let mediaStream = null;
@@ -62,13 +73,14 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
     const ctx = canvas.getContext("2d");
 
     async function iniciar() {
+      console.log("[WebcamCapturePusher] chamando getUserMedia()...");
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
           video: { width: LARGURA, height: ALTURA },
           audio: false,
         });
       } catch (err) {
-        console.warn("[WebcamCapturePusher] getUserMedia falhou:", err);
+        console.error("[WebcamCapturePusher] Erro na conexão: getUserMedia falhou —", err);
         if (!cancelado) {
           setStatus("erro");
           setMensagemErro("Não foi possível acessar sua webcam (permissão negada ou nenhuma câmera encontrada).");
@@ -79,6 +91,7 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
         mediaStream.getTracks().forEach((t) => t.stop());
         return;
       }
+      console.log("[WebcamCapturePusher] Webcam iniciada com sucesso — tracks:", mediaStream.getVideoTracks().map((t) => t.label));
 
       video.srcObject = mediaStream;
       try {
@@ -87,28 +100,44 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
         // Alguns navegadores exigem um gesto do usuário pra autoplay — o
         // elemento fica pronto mesmo assim assim que a página tiver o gesto;
         // logamos pra facilitar diagnóstico se o vídeo nunca ficar pronto.
-        console.warn("[WebcamCapturePusher] video.play() rejeitado (pode ser normal, ver comentário):", err);
+        console.warn("[WebcamCapturePusher] video.play() rejeitado (pode ser normal, ver comentário no código):", err);
       }
 
       setStatus("aguardando");
 
-      ws = new WebSocket(getCameraIngestWsUrl(camera.id));
+      const wsUrl = getCameraIngestWsUrl(camera.id);
+      console.log("[WebcamCapturePusher] Tentando conectar WebSocket/Endpoint do backend...", wsUrl.replace(/token=[^&]+/, "token=***"));
+      ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
 
-      ws.onclose = () => {
+      ws.onopen = () => console.log("[WebcamCapturePusher] WebSocket aberto — aguardando o <video> ficar pronto pra começar a enviar frames.");
+      ws.onclose = (ev) => {
+        console.log("[WebcamCapturePusher] WebSocket fechado — code=%s reason=%s", ev.code, ev.reason || "(sem motivo informado pelo servidor)");
         if (!cancelado) setStatus("conectando");
       };
       ws.onerror = (err) => {
-        console.warn("[WebcamCapturePusher] erro no WebSocket:", err);
+        console.error("[WebcamCapturePusher] Erro na conexão: WebSocket —", err);
         if (!cancelado) {
           setStatus("erro");
           setMensagemErro("Falha na conexão com o backend para enviar sua webcam.");
         }
       };
 
+      let tentativas = 0;
       intervalo = setInterval(() => {
+        tentativas += 1;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        if (video.readyState < 2) return; // HAVE_CURRENT_DATA — ainda não há frame decodificado pra capturar
+        if (video.readyState < 2) {
+          // HAVE_CURRENT_DATA — ainda não há frame decodificado pra capturar.
+          // Só um aviso pontual em ~3s (não a cada 200ms) se isso nunca resolver.
+          if (tentativas === 15) {
+            console.warn(
+              "[WebcamCapturePusher] video.readyState ainda é %s depois de ~3s com WS aberto — o <video> não está decodificando frames.",
+              video.readyState
+            );
+          }
+          return;
+        }
         ctx.drawImage(video, 0, 0, LARGURA, ALTURA);
         canvas.toBlob(
           (blob) => {
@@ -118,6 +147,7 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
               ws.send(buf);
               if (!jaEnviouAlgumFrame) {
                 jaEnviouAlgumFrame = true;
+                console.log("[WebcamCapturePusher] primeiro frame enviado com sucesso —", buf.byteLength, "bytes.");
                 if (!cancelado) {
                   setStatus("enviando");
                   onEnviando?.();
