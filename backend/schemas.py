@@ -2,7 +2,7 @@
 Schemas Pydantic — contratos de entrada/saída da API.
 """
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -121,6 +121,12 @@ class CameraBase(BaseModel):
 
 
 class CameraCreate(CameraBase):
+    # Produto simplificado 100% para varejo/supermercado: só "balcao_loja" é
+    # selecionável em câmera NOVA (`escritorio`/`estoque` seguem existindo em
+    # `models.PerfilCamera` — e em `CameraOut`, sem essa restrição — só para
+    # não quebrar a leitura de câmeras antigas já configuradas com esses
+    # perfis; não dá mais para criar/migrar nenhuma câmera para eles).
+    perfil_ativo: Literal[PerfilCamera.balcao_loja] = PerfilCamera.balcao_loja
     # Ignorado quando quem cria não é SUPER_ADMIN — nesse caso o backend força
     # a própria empresa do usuário autenticado (ver routes.criar_camera).
     empresa_id: Optional[int] = None
@@ -129,7 +135,7 @@ class CameraCreate(CameraBase):
 class CameraUpdate(BaseModel):
     nome_camera: Optional[str] = None
     rtsp_url: Optional[str] = None
-    perfil_ativo: Optional[PerfilCamera] = None
+    perfil_ativo: Optional[Literal[PerfilCamera.balcao_loja]] = None
     status: Optional[StatusCamera] = None
 
 
@@ -143,7 +149,13 @@ class CameraOut(CameraBase):
 
 # ---------- Zona ----------
 class ZonaCreate(BaseModel):
-    tipo_zona: TipoZona
+    # Produto simplificado 100% para varejo/supermercado: só "atendente" e
+    # "cliente" são selecionáveis pro usuário desenhar. `trabalho`/`neutra`
+    # seguem existindo em `models.TipoZona` — e em `ZonaOut`, sem essa
+    # restrição — só para não quebrar a leitura de zonas antigas já
+    # desenhadas com esses tipos (perfis escritorio/estoque, hoje legados —
+    # ver CameraCreate.perfil_ativo); não dá mais para criar zona nova deles.
+    tipo_zona: Literal[TipoZona.atendente, TipoZona.cliente]
     coordenadas: List[Ponto] = Field(
         description="Pontos [x, y] normalizados (0.0 a 1.0) formando o polígono/retângulo da zona"
     )

@@ -33,18 +33,37 @@ export function formatDataHora(iso) {
   }
 }
 
+// Produto simplificado 100% para varejo/supermercado — só "Balcão de Loja" é
+// selecionável em câmera nova (o backend também restringe isso, ver
+// schemas.CameraCreate/CameraUpdate). "escritorio"/"estoque" continuam aqui
+// (não removidos do mapa) só para o rótulo de uma câmera ANTIGA já
+// configurada com um desses perfis continuar aparecendo certo — eles não são
+// mais oferecidos em nenhum formulário/dropdown de seleção.
 export const PERFIL_CAMERA_LABELS = {
   balcao_loja: "Balcão de Loja",
-  escritorio: "Escritório",
-  estoque: "Estoque",
+  escritorio: "Escritório (legado)",
+  estoque: "Estoque (legado)",
 };
 
+// Único ponto usado pelo dropdown de perfil no formulário de câmera — mesma
+// ideia de TIPO_ZONA_OPCOES_SELECIONAVEIS abaixo.
+export const PERFIL_CAMERA_OPCOES_SELECIONAVEIS = ["balcao_loja"];
+
+// Idem: mantém "trabalho"/"neutra" pro RÓTULO/COR de uma zona antiga (de
+// câmera com perfil escritorio/estoque) continuar renderizando certo onde já
+// estiver desenhada — só não aparecem mais como opção pra criar zona nova
+// (ver TIPO_ZONA_OPCOES_SELECIONAVEIS, usado no dropdown do ZoneEditor).
 export const TIPO_ZONA_LABELS = {
   atendente: "Atendente",
   cliente: "Cliente",
-  trabalho: "Trabalho",
-  neutra: "Neutra",
+  trabalho: "Trabalho (legado)",
+  neutra: "Neutra (legado)",
 };
+
+// Único ponto usado pelo dropdown de "criar zona nova" (ZoneEditor) — produto
+// simplificado 100% varejo/supermercado: só estes dois tipos podem ser
+// desenhados. O backend aplica a mesma restrição (schemas.ZonaCreate).
+export const TIPO_ZONA_OPCOES_SELECIONAVEIS = ["atendente", "cliente"];
 
 /**
  * Classificação simples (heurística, sem capacidade configurada no backend) do nível
@@ -59,8 +78,8 @@ export function nivelMovimentacao(mediaPessoas = 0) {
 export const TIPO_ZONA_CORES = {
   atendente: "#f97316", // laranja
   cliente: "#22c55e", // verde
-  trabalho: "#f59e0b", // âmbar
-  neutra: "#a1a1aa", // cinza
+  trabalho: "#f59e0b", // âmbar — legado, ver TIPO_ZONA_LABELS
+  neutra: "#a1a1aa", // cinza — legado, ver TIPO_ZONA_LABELS
 };
 
 /** Rótulo e cor (tone do <Badge>) de cada status_assinatura da empresa. */

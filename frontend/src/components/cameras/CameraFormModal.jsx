@@ -5,7 +5,7 @@ import ErrorBanner from "../ui/ErrorBanner";
 import Input from "../ui/Input";
 import Modal from "../ui/Modal";
 import Select from "../ui/Select";
-import { PERFIL_CAMERA_LABELS } from "../../utils/format";
+import { PERFIL_CAMERA_LABELS, PERFIL_CAMERA_OPCOES_SELECIONAVEIS } from "../../utils/format";
 
 const VALOR_INICIAL = { nome_camera: "", rtsp_url: "0", perfil_ativo: "balcao_loja" };
 
@@ -111,9 +111,9 @@ export default function CameraFormModal({ open, onClose, onSubmit, cameraEmEdica
           value={form.perfil_ativo}
           onChange={(e) => setForm({ ...form, perfil_ativo: e.target.value })}
         >
-          {Object.entries(PERFIL_CAMERA_LABELS).map(([valor, rotulo]) => (
+          {PERFIL_CAMERA_OPCOES_SELECIONAVEIS.map((valor) => (
             <option key={valor} value={valor}>
-              {rotulo}
+              {PERFIL_CAMERA_LABELS[valor]}
             </option>
           ))}
         </Select>

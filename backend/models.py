@@ -28,6 +28,15 @@ from database import Base
 
 class PerfilCamera(str, enum.Enum):
     balcao_loja = "balcao_loja"
+    # Legado: produto simplificado 100% para varejo/supermercado — não é mais
+    # possível criar/migrar uma câmera para estes perfis (ver
+    # schemas.CameraCreate/CameraUpdate, que restringem a só "balcao_loja").
+    # Mantidos aqui (em vez de removidos) só para não quebrar a leitura de
+    # câmeras antigas que já tinham um desses perfis configurado — o ENUM
+    # nativo do Postgres também não permite remover um label depois de criado
+    # sem recriar o tipo. `vision.VideoProcessor` ainda sabe processá-los
+    # (_atualizar_escritorio/_atualizar_estoque) caso alguma câmera legada
+    # ainda os use.
     escritorio = "escritorio"
     estoque = "estoque"
 
@@ -40,6 +49,10 @@ class StatusCamera(str, enum.Enum):
 class TipoZona(str, enum.Enum):
     atendente = "atendente"
     cliente = "cliente"
+    # Legado: zonas dos perfis escritorio/estoque (hoje legados — ver
+    # PerfilCamera acima). Não é mais possível DESENHAR zona nova destes
+    # tipos (ver schemas.ZonaCreate, restrita a atendente/cliente); mantidos
+    # aqui só para não quebrar a leitura de zonas antigas já desenhadas.
     trabalho = "trabalho"
     neutra = "neutra"
 

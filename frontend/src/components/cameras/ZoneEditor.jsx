@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { getVideoFeedUrl } from "../../api/cameras";
 import Button from "../ui/Button";
 import Select from "../ui/Select";
-import { TIPO_ZONA_CORES, TIPO_ZONA_LABELS } from "../../utils/format";
+import { TIPO_ZONA_CORES, TIPO_ZONA_LABELS, TIPO_ZONA_OPCOES_SELECIONAVEIS } from "../../utils/format";
 import WebcamCapturePusher from "./WebcamCapturePusher";
 
 const RETRY_AUTOMATICO_MS = 5000;
@@ -73,9 +73,9 @@ export default function ZoneEditor({ camera, zonas, onChangeZonas }) {
           onChange={(e) => setTipoSelecionado(e.target.value)}
           className="w-48"
         >
-          {Object.entries(TIPO_ZONA_LABELS).map(([valor, rotulo]) => (
+          {TIPO_ZONA_OPCOES_SELECIONAVEIS.map((valor) => (
             <option key={valor} value={valor}>
-              {rotulo}
+              {TIPO_ZONA_LABELS[valor]}
             </option>
           ))}
         </Select>
