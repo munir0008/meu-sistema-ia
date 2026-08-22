@@ -59,6 +59,7 @@ from auth import (
     verify_password,
 )
 from database import SessionLocal, get_db
+import vision
 from vision import FONTE_WEBCAM_NAVEGADOR, BrowserPushStream, camera_manager
 
 router = APIRouter()
@@ -639,6 +640,17 @@ def video_feed(
     # CameraStream está de fato entregando frames (ver vision.py).
     processador = camera_manager.get_or_create(camera, zonas, SessionLocal)
 
+    if (camera.rtsp_url or "").strip().lower() == FONTE_WEBCAM_NAVEGADOR:
+        # Caminho DIRETO e definitivo: serve o último frame recebido em
+        # camera_ingest com um cv2.blur genérico, sem depender do modelo YOLO
+        # nem da thread de processamento assíncrono de VideoProcessor — ver
+        # vision.gerar_mjpeg_bruto_com_blur. Câmeras RTSP/webcam local continuam
+        # no pipeline completo (generate_mjpeg) logo abaixo.
+        return StreamingResponse(
+            vision.gerar_mjpeg_bruto_com_blur(camera.id),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
     return StreamingResponse(
         processador.generate_mjpeg(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -720,6 +732,13 @@ async def camera_ingest(websocket: WebSocket, camera_id: int):
             if frame is None:
                 logger.warning("[camera %s] frame recebido (%d bytes) não pôde ser decodificado — descartado.", camera_id, len(data))
                 continue
+            # Caminho DIRETO e definitivo (bypass do YOLO) usado por /api/video_feed
+            # — ver docstring de vision.gerar_mjpeg_bruto_com_blur. Gravação simples
+            # em dict global com lock, sem fila nem thread própria.
+            vision.armazenar_frame_bruto(camera_id, frame)
+            # Pipeline de IA (analytics de fila/atendimento/estagnação) continua
+            # recebendo o frame normalmente — só a EXIBIÇÃO do vídeo não depende
+            # mais dele.
             processador.stream.push_frame(frame)
             frames_recebidos += 1
             if frames_recebidos == 1:

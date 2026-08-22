@@ -173,6 +173,83 @@ class CameraStream:
 FONTE_WEBCAM_NAVEGADOR = "browser"
 
 
+# ----------------------------------------------------------------------------
+# Caminho DIRETO de exibição para câmeras de webcam do navegador — bypass
+# total do pipeline de IA (YOLO + thread `_loop_processamento` de
+# VideoProcessor). Existe porque a tela preta persistiu em produção mesmo
+# depois do fallback pixelizado em `_loop_processamento` (que só cobre
+# exceções DENTRO de `processar_frame` — não cobre o modelo travando/demorando
+# demais para carregar, nem qualquer outro problema na própria thread).
+#
+# `routes.camera_ingest` grava aqui, direto, o frame que acabou de decodificar
+# — sem fila, sem thread própria, um dict global protegido por lock só. E
+# `/api/video_feed` (para câmera de navegador) lê daqui e serve com um
+# cv2.blur genérico no frame INTEIRO (não depende de nenhuma detecção) — ver
+# `gerar_mjpeg_bruto_com_blur`. Nada aqui passa perto do YOLO: se o problema
+# estiver em QUALQUER parte do pipeline de IA, esse caminho continua
+# funcionando porque não depende dele.
+#
+# Isso é ADICIONAL ao pipeline de IA existente, não uma substituição: o ingest
+# continua chamando `BrowserPushStream.push_frame` normalmente logo em
+# seguida, então a analytics (fila, atendimento, YOLO) de câmeras de
+# navegador continua rodando — só a EXIBIÇÃO do vídeo é que passou a não
+# depender mais dela.
+_ULTIMO_FRAME_BRUTO: Dict[int, Tuple[np.ndarray, float]] = {}
+_ULTIMO_FRAME_BRUTO_LOCK = threading.Lock()
+
+
+def armazenar_frame_bruto(camera_id: int, frame: np.ndarray) -> None:
+    """Chamado por `routes.camera_ingest` a cada frame recebido do navegador."""
+    with _ULTIMO_FRAME_BRUTO_LOCK:
+        _ULTIMO_FRAME_BRUTO[camera_id] = (frame, time.monotonic())
+
+
+def _ler_frame_bruto_fresco(camera_id: int) -> Optional[np.ndarray]:
+    with _ULTIMO_FRAME_BRUTO_LOCK:
+        entrada = _ULTIMO_FRAME_BRUTO.get(camera_id)
+    if entrada is None:
+        return None
+    frame, recebido_em = entrada
+    # Mesmo critério de "frescor" do BrowserPushStream — não mostra um frame
+    # congelado indefinidamente se o navegador parou de mandar frames.
+    if (time.monotonic() - recebido_em) >= config.CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS:
+        return None
+    return frame.copy()
+
+
+def gerar_mjpeg_bruto_com_blur(camera_id: int):
+    """
+    Generator MJPEG DEFINITIVO para câmera de navegador: lê o último frame de
+    `_ULTIMO_FRAME_BRUTO`, aplica `cv2.blur` genérico no frame inteiro (cobre
+    qualquer rosto/pessoa, sem depender de detecção — suficiente para LGPD) e
+    entrega. Sem YOLO, sem thread de VideoProcessor, sem fila.
+    """
+    intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
+    inicio_espera = time.monotonic()
+    teve_frame = False
+    while True:
+        frame = _ler_frame_bruto_fresco(camera_id)
+        if frame is None:
+            if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
+                logger.warning(
+                    "[camera %s] nenhum frame bruto em %.0fs — encerrando streaming direto deste viewer.",
+                    camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
+                )
+                return
+            time.sleep(0.1)
+            continue
+
+        if not teve_frame:
+            logger.info("[camera %s] primeiro frame BRUTO (bypass) entregue a um viewer.", camera_id)
+        teve_frame = True
+
+        borrado = cv2.blur(frame, (config.BLUR_KERNEL, config.BLUR_KERNEL))
+        ok, buffer = cv2.imencode(".jpg", borrado, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY])
+        if ok:
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
+        time.sleep(intervalo)
+
+
 class BrowserPushStream:
     """
     Fonte de frames alimentada por PUSH externo (via WebSocket), em vez de aberta
