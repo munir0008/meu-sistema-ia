@@ -183,11 +183,12 @@ FONTE_WEBCAM_NAVEGADOR = "browser"
 #
 # `routes.camera_ingest` grava aqui, direto, o frame que acabou de decodificar
 # — sem fila, sem thread própria, um dict global protegido por lock só. E
-# `/api/video_feed` (para câmera de navegador) lê daqui e serve com um
-# cv2.blur genérico no frame INTEIRO (não depende de nenhuma detecção) — ver
-# `gerar_mjpeg_bruto_com_blur`. Nada aqui passa perto do YOLO: se o problema
-# estiver em QUALQUER parte do pipeline de IA, esse caminho continua
-# funcionando porque não depende dele.
+# `/api/video_feed` (para câmera de navegador) lê daqui e serve com blur
+# aplicado só nas bounding boxes de rosto detectadas (MediaPipe leve, isolado
+# por try/except — ver `gerar_mjpeg_bruto_com_blur`), nunca no frame inteiro.
+# Nada aqui passa perto do YOLO: se o problema estiver em QUALQUER parte do
+# pipeline de IA pesado, esse caminho continua funcionando porque não depende
+# dele.
 #
 # Isso é ADICIONAL ao pipeline de IA existente, não uma substituição: o ingest
 # continua chamando `BrowserPushStream.push_frame` normalmente logo em
@@ -217,16 +218,76 @@ def _ler_frame_bruto_fresco(camera_id: int) -> Optional[np.ndarray]:
     return frame.copy()
 
 
+def _detectar_rostos_isolado(detector_facial, frame: np.ndarray):
+    """
+    Roda o detector de rosto (MediaPipe) num frame e devolve a lista de
+    bounding boxes em pixel — ou `None` se a detecção falhar. Deliberadamente
+    a ÚNICA coisa que pode lançar aqui é a chamada ao modelo em si: qualquer
+    exceção (modelo não carrega, frame incompatível, etc.) é isolada nesta
+    função e vira `None` pro chamador, que decide o que fazer (ver
+    `gerar_mjpeg_bruto_com_blur`) — nunca propaga pra derrubar o streaming
+    nem pra justificar borrar o frame inteiro.
+    """
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resultado = detector_facial.process(rgb)
+    except Exception:
+        logger.exception("detector de rosto lançou exceção ao processar o frame.")
+        return None
+
+    if not resultado.detections:
+        return []
+
+    h, w = frame.shape[:2]
+    boxes = []
+    for det in resultado.detections:
+        bbox = det.location_data.relative_bounding_box
+        x1 = int(bbox.xmin * w)
+        y1 = int(bbox.ymin * h)
+        x2 = int((bbox.xmin + bbox.width) * w)
+        y2 = int((bbox.ymin + bbox.height) * h)
+        boxes.append((x1, y1, x2, y2))
+    return boxes
+
+
 def gerar_mjpeg_bruto_com_blur(camera_id: int):
     """
     Generator MJPEG DEFINITIVO para câmera de navegador: lê o último frame de
-    `_ULTIMO_FRAME_BRUTO`, aplica `cv2.blur` genérico no frame inteiro (cobre
-    qualquer rosto/pessoa, sem depender de detecção — suficiente para LGPD) e
-    entrega. Sem YOLO, sem thread de VideoProcessor, sem fila.
+    `_ULTIMO_FRAME_BRUTO` e entrega, sem YOLO, sem thread de VideoProcessor,
+    sem fila — só um detector de rosto leve (MediaPipe FaceDetection,
+    instanciado uma vez por conexão) rodando aqui mesmo, nesta thread do
+    generator (uma por viewer, então sem necessidade de lock nele).
+
+    O blur é aplicado EXCLUSIVAMENTE sobre a bounding box de cada rosto
+    detectado com sucesso — nunca no frame inteiro. Se o detector não achar
+    nenhum rosto OU lançar uma exceção pontual (isolada em
+    `_detectar_rostos_isolado`, que nunca deixa essa exceção vazar até aqui),
+    o frame sai LIMPO, sem blur nenhum: uma falha do detector não pode nunca
+    resultar em pixelizar a tela inteira.
+
+    Aviso de LGPD: isso é uma troca deliberada pedida explicitamente — se o
+    detector falhar num frame com pessoas de verdade nele, esse frame
+    específico sai SEM anonimização (não borrado). Divergem aqui do padrão
+    "fail-safe" usado em `_frame_fallback_seguro` (que preferia pixelizar
+    tudo a arriscar vazar um rosto). Se isso virar recorrente nos logs
+    ("detector de rosto lançou exceção"), vale revisitar essa troca.
     """
     intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
     inicio_espera = time.monotonic()
     teve_frame = False
+
+    detector_facial = None
+    try:
+        import mediapipe as mp
+
+        detector_facial = mp.solutions.face_detection.FaceDetection(
+            model_selection=0, min_detection_confidence=0.5
+        )
+    except Exception:
+        # Nem a CRIAÇÃO do detector pode derrubar o streaming — sem detector,
+        # todo frame simplesmente sai limpo (ver uso de `detector_facial` abaixo).
+        logger.exception("[camera %s] falha ao inicializar o detector de rosto — streaming seguirá sem blur.", camera_id)
+
     while True:
         frame = _ler_frame_bruto_fresco(camera_id)
         if frame is None:
@@ -243,8 +304,14 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
             logger.info("[camera %s] primeiro frame BRUTO (bypass) entregue a um viewer.", camera_id)
         teve_frame = True
 
-        borrado = cv2.blur(frame, (config.BLUR_KERNEL, config.BLUR_KERNEL))
-        ok, buffer = cv2.imencode(".jpg", borrado, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY])
+        saida = frame
+        boxes = _detectar_rostos_isolado(detector_facial, frame) if detector_facial is not None else None
+        if boxes:
+            saida = frame.copy()
+            for x1, y1, x2, y2 in boxes:
+                VideoProcessor._blur_regiao(saida, x1, y1, x2, y2)
+
+        ok, buffer = cv2.imencode(".jpg", saida, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY])
         if ok:
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
         time.sleep(intervalo)
