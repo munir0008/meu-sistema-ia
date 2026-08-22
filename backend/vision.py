@@ -204,14 +204,19 @@ _ULTIMO_FRAME_BRUTO: Dict[int, Tuple[np.ndarray, float]] = {}
 _ULTIMO_FRAME_BRUTO_LOCK = threading.Lock()
 
 # XML do Haar Cascade BUNDLADO no repo (backend/haarcascade_frontalface_default.xml)
-# em vez de referenciar cv2.data.haarcascades: confirmado em dev que pelo menos
-# uma versão recente de opencv-python-headless (5.0.0.93, puxada por
+# tentado ANTES de cv2.data.haarcascades: confirmado em dev que pelo menos uma
+# versão recente de opencv-python-headless (5.0.0.93, puxada por
 # `opencv-python-headless>=4.9.0.80` sem teto de versão) NÃO inclui os XMLs de
 # haarcascade no pacote — cv2.data.haarcascades aponta pra uma pasta vazia
-# nesse caso, o que deixaria o CascadeClassifier permanentemente `.empty()`
-# (detectMultiScale levantaria cv2.error em TODO frame). Um arquivo próprio,
-# versionado no git, não depende de qual versão do pacote foi instalada.
+# nesse caso, o que deixaria o CascadeClassifier permanentemente `.empty()`.
+# Um arquivo próprio, versionado no git, não depende de qual versão do pacote
+# foi instalada — daí vir primeiro na lista de candidatos abaixo. Ver
+# `_carregar_cascade_rosto` pra a cadeia de fallback completa.
 _HAARCASCADE_ROSTO_PATH = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
+_HAARCASCADE_CANDIDATOS = [
+    _HAARCASCADE_ROSTO_PATH,
+    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"),
+]
 
 # Detecção só a cada N frames — reaproveita as boxes do último frame
 # detectado nos frames intermediários (ver `gerar_mjpeg_bruto_com_blur`).
@@ -279,21 +284,36 @@ def _ler_frame_bruto_fresco(camera_id: int) -> Optional[np.ndarray]:
 
 def _carregar_cascade_rosto():
     """
-    Carrega o Haar Cascade a partir do XML bundlado no repo (ver
-    `_HAARCASCADE_ROSTO_PATH`). Nativo do OpenCV — sem processo/lib externa,
-    sem exceção esperada em uso normal — mas ainda assim isolado em
-    try/except: se o arquivo não existir ou estiver corrompido, o streaming
-    segue sem blur (nunca derruba nada) em vez de travar a conexão do viewer.
+    Carrega o Haar Cascade tentando, em ordem, cada caminho de
+    `_HAARCASCADE_CANDIDATOS` — inicialização SEGURA: qualquer falha (arquivo
+    ausente, corrompido, cv2.error, o que for) em um candidato só faz tentar o
+    próximo; se TODOS falharem, devolve `None` e o streaming segue com o frame
+    limpo (sem blur), nunca derruba nada nem trava a conexão do viewer (ver
+    `gerar_mjpeg_bruto_com_blur`, que já trata `cascade is None` como estado
+    normal).
+
+    Por que dois candidatos em vez de só `cv2.data.haarcascades` (o caminho
+    nativo do próprio pacote OpenCV): confirmado em dev que pelo menos uma
+    versão recente de `opencv-python-headless` (a que `pip install` resolve
+    hoje para `opencv-python-headless>=4.9.0.80`, sem teto de versão) NÃO
+    inclui os XMLs de dado no pacote — `cv2.data.haarcascades` aponta pra uma
+    pasta vazia nesse caso, então CascadeClassifier fica `.empty()` sempre.
+    Por isso o XML também está bundlado no repo (`_HAARCASCADE_ROSTO_PATH`) e
+    tentado PRIMEIRO — não depende de qual versão do pacote foi instalada.
+    `cv2.data.haarcascades` continua como segundo candidato: barato de tentar,
+    e cobre o caso de um ambiente cujo opencv-python-headless INCLUA os dados.
     """
-    try:
-        cascade = cv2.CascadeClassifier(_HAARCASCADE_ROSTO_PATH)
-        if cascade.empty():
-            logger.error("Haar Cascade não carregou (%s) — streaming seguirá sem blur.", _HAARCASCADE_ROSTO_PATH)
-            return None
-        return cascade
-    except Exception:
-        logger.exception("Falha ao carregar Haar Cascade (%s) — streaming seguirá sem blur.", _HAARCASCADE_ROSTO_PATH)
-        return None
+    for caminho in _HAARCASCADE_CANDIDATOS:
+        try:
+            cascade = cv2.CascadeClassifier(caminho)
+            if not cascade.empty():
+                return cascade
+            logger.warning("Haar Cascade vazio em %s — tentando próximo candidato.", caminho)
+        except Exception:
+            logger.exception("Falha ao carregar Haar Cascade de %s — tentando próximo candidato.", caminho)
+
+    logger.error("Nenhum Haar Cascade pôde ser carregado (candidatos: %s) — streaming seguirá sem blur.", _HAARCASCADE_CANDIDATOS)
+    return None
 
 
 def _detectar_rostos_cascade(cascade, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
