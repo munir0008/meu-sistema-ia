@@ -19,8 +19,10 @@ Fluxo de autenticação:
    `garantir_assinatura_ativa` (bloqueia com 403 se a empresa não estiver com
    assinatura ativa — inclui contas recém-cadastradas em `pending_payment`).
 """
+import asyncio
 import json
 import logging
+import threading
 from collections import defaultdict
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Optional
@@ -39,6 +41,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -623,8 +626,9 @@ def listar_zonas(
 #   - ADMIN/USER só acessam as próprias câmeras. SUPER_ADMIN acessa qualquer uma.
 # ==============================================================================
 @router.get("/api/video_feed/{camera_id}", tags=["video"])
-def video_feed(
+async def video_feed(
     camera_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     atual: models.Usuario = Depends(get_current_usuario_stream),
 ):
@@ -640,20 +644,49 @@ def video_feed(
     # CameraStream está de fato entregando frames (ver vision.py).
     processador = camera_manager.get_or_create(camera, zonas, SessionLocal)
 
+    # Sinaliza pro generator (sync, rodando na threadpool do Starlette) que o
+    # cliente HTTP desconectou (fechou a aba, navegou pra outra tela) — sem
+    # isso, cada viewer abandonado seguia rodando detecção+encode pra sempre,
+    # sem ninguém do outro lado, empilhando CPU/memória por viewer "fantasma"
+    # até o worker do Render estourar (OOM) depois de alguns minutos de uso.
+    # Um `threading.Event` porque o generator não é async (cv2 é CPU-bound —
+    # rodar fora do event loop, na threadpool, é o que mantém a API
+    # respondendo enquanto o stream processa frames).
+    parar_por_desconexao = threading.Event()
+
+    async def _observar_desconexao_cliente() -> None:
+        try:
+            while not parar_por_desconexao.is_set():
+                if await request.is_disconnected():
+                    break
+                await asyncio.sleep(1.0)
+        finally:
+            parar_por_desconexao.set()
+
+    tarefa_observadora = asyncio.ensure_future(_observar_desconexao_cliente())
+
+    def _parar_observador() -> None:
+        # Roda como BackgroundTask do Starlette, DEPOIS que o streaming da
+        # resposta termina (generator encerrado por qualquer motivo) — libera
+        # a tarefa observadora em vez de deixá-la rodando pra sempre.
+        parar_por_desconexao.set()
+        tarefa_observadora.cancel()
+
     if (camera.rtsp_url or "").strip().lower() == FONTE_WEBCAM_NAVEGADOR:
         # Caminho DIRETO e definitivo: serve o último frame recebido em
-        # camera_ingest com um cv2.blur genérico, sem depender do modelo YOLO
-        # nem da thread de processamento assíncrono de VideoProcessor — ver
-        # vision.gerar_mjpeg_bruto_com_blur. Câmeras RTSP/webcam local continuam
-        # no pipeline completo (generate_mjpeg) logo abaixo.
-        return StreamingResponse(
-            vision.gerar_mjpeg_bruto_com_blur(camera.id),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-        )
+        # camera_ingest com blur seletivo de rosto (Haar Cascade), sem
+        # depender do modelo YOLO nem da thread de processamento assíncrono de
+        # VideoProcessor — ver vision.gerar_mjpeg_bruto_com_blur. Câmeras
+        # RTSP/webcam local continuam no pipeline completo (generate_mjpeg)
+        # logo abaixo.
+        gerador = vision.gerar_mjpeg_bruto_com_blur(camera.id, parar_por_desconexao)
+    else:
+        gerador = processador.generate_mjpeg(parar_por_desconexao)
 
     return StreamingResponse(
-        processador.generate_mjpeg(),
+        gerador,
         media_type="multipart/x-mixed-replace; boundary=frame",
+        background=BackgroundTask(_parar_observador),
     )
 
 
@@ -750,6 +783,15 @@ async def camera_ingest(websocket: WebSocket, camera_id: int):
                 logger.info("[camera %s] primeiro frame decodificado e entregue ao processador (shape=%s).", camera_id, frame.shape)
     except WebSocketDisconnect:
         logger.info("[camera %s] navegador desconectou de camera_ingest (recebeu %d frames).", camera_id, frames_recebidos)
+    finally:
+        # Libera o último frame bruto imediatamente (não espera o timeout de
+        # frescor) — ver vision.limpar_frame_bruto. Deliberadamente NÃO
+        # derruba `processador`/`BrowserPushStream` nem fecha nenhum viewer de
+        # /video_feed ainda conectado: um viewer pode legitimamente continuar
+        # olhando o último frame por alguns segundos (até o timeout de
+        # frescor) mesmo com o ingest reconectando, e a analytics não deveria
+        # parar só porque ninguém está olhando a tela.
+        vision.limpar_frame_bruto(camera_id)
 
 
 # ==============================================================================

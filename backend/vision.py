@@ -34,6 +34,7 @@ gravados nas tabelas metricas_atendimento / metricas_ocupacao.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import os
@@ -215,15 +216,14 @@ _HAARCASCADE_ROSTO_PATH = os.path.join(os.path.dirname(__file__), "haarcascade_f
 # Detecção só a cada N frames — reaproveita as boxes do último frame
 # detectado nos frames intermediários (ver `gerar_mjpeg_bruto_com_blur`).
 # Reduz o custo de CPU do stream ao vivo sem perder a resposta visual do blur
-# seguindo o rosto (a ~STREAM_TARGET_FPS fps, 1 detecção a cada 4 frames ainda
-# é bem mais que suficiente pra acompanhar movimento normal de webcam).
-_DETECCAO_A_CADA_N_FRAMES = 4
+# seguindo o rosto.
+_DETECCAO_A_CADA_N_FRAMES = 3
 
 # Resolução usada SÓ para o CÁLCULO do detector — quanto maior o frame de
 # entrada, mais caro o Haar Cascade (ele varre em múltiplas escalas). O frame
 # de SAÍDA continua na resolução original; as boxes encontradas são escaladas
-# de volta proporcionalmente antes do blur (ver `_escalar_boxes`).
-_DETECCAO_LARGURA_MAX = 480
+# de volta proporcionalmente antes do blur (ver `_detectar_rostos_cascade`).
+_DETECCAO_LARGURA_MAX = 320
 
 # Qualidade JPEG deste stream direto — mais agressiva que o padrão do resto do
 # pipeline (`config.STREAM_JPEG_QUALITY`, tipicamente 80) porque aqui o
@@ -232,11 +232,36 @@ _DETECCAO_LARGURA_MAX = 480
 # reduz bastante o peso de cada frame transferido.
 _STREAM_BRUTO_JPEG_QUALITY = 55
 
+# Teto DURO de FPS deste stream, independente de `config.STREAM_TARGET_FPS`
+# (que poderia ser configurado mais alto via env var) — Render tem CPU
+# limitada, e um MJPEG de webcam não precisa de mais que isso pra parecer
+# fluido. Mantém o `time.sleep`/GC previsíveis mesmo se a config global mudar.
+_STREAM_BRUTO_FPS_MAXIMO = 15
+
+# A cada quantos frames força uma coleta de lixo — libera os buffers de
+# imagem (numpy arrays intermediários do resize/cvtColor/imencode) que o GC
+# geracional do Python levaria mais tempo pra coletar sozinho. Não é por
+# frame (custo da coleta em si não compensaria) nem raro demais (a cada
+# ~10-13s a 15fps/3 é frequente o bastante pra não deixar acumular).
+_GC_A_CADA_N_FRAMES = 200
+
 
 def armazenar_frame_bruto(camera_id: int, frame: np.ndarray) -> None:
     """Chamado por `routes.camera_ingest` a cada frame recebido do navegador."""
     with _ULTIMO_FRAME_BRUTO_LOCK:
         _ULTIMO_FRAME_BRUTO[camera_id] = (frame, time.monotonic())
+
+
+def limpar_frame_bruto(camera_id: int) -> None:
+    """
+    Chamado por `routes.camera_ingest` quando o navegador desconecta — libera
+    imediatamente o último frame em memória (em vez de só deixar de ser
+    "fresco" depois de `CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS`, ver
+    `_ler_frame_bruto_fresco`). Também faz `gerar_mjpeg_bruto_com_blur` parar
+    de entregar frame pra qualquer viewer ainda conectado dessa câmera.
+    """
+    with _ULTIMO_FRAME_BRUTO_LOCK:
+        _ULTIMO_FRAME_BRUTO.pop(camera_id, None)
 
 
 def _ler_frame_bruto_fresco(camera_id: int) -> Optional[np.ndarray]:
@@ -295,7 +320,7 @@ def _detectar_rostos_cascade(cascade, frame: np.ndarray) -> List[Tuple[int, int,
     return boxes
 
 
-def gerar_mjpeg_bruto_com_blur(camera_id: int):
+def gerar_mjpeg_bruto_com_blur(camera_id: int, parar_eventualmente: Optional[threading.Event] = None):
     """
     Generator MJPEG DEFINITIVO para câmera de navegador: lê o último frame de
     `_ULTIMO_FRAME_BRUTO` e entrega, sem YOLO, sem thread de VideoProcessor,
@@ -309,11 +334,20 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
     `_DETECCAO_A_CADA_N_FRAMES` frames (as boxes do último resultado são
     reaproveitadas nos intermediários) e numa versão reduzida do frame (ver
     `_DETECCAO_LARGURA_MAX`) — ambos pra manter o FPS do stream ao vivo sem
-    pesar a CPU a cada frame recebido.
+    pesar a CPU a cada frame recebido. FPS travado em `_STREAM_BRUTO_FPS_MAXIMO`.
 
     O corpo do loop inteiro roda dentro de um try/except: qualquer falha
     pontual (cascade, resize, encode, o que for) faz o frame BRUTO (sem blur)
     ser entregue e o loop segue pro próximo — nunca trava o generator.
+
+    `parar_eventualmente`: `threading.Event` opcional que `routes.video_feed`
+    seta assim que detecta que o cliente HTTP desconectou (fechou a aba,
+    navegou pra outra tela) — checado a cada frame para encerrar o generator
+    IMEDIATAMENTE em vez de continuar rodando cascade+encode indefinidamente
+    sem ninguém consumindo. Sem isso, cada viewer "fantasma" acumulava CPU/
+    memória até o worker do Render estourar (OOM) depois de alguns minutos de
+    uso — era esse o disparador real do "Não foi possível carregar as
+    câmeras".
 
     Aviso de LGPD: isso é uma troca deliberada pedida explicitamente — se a
     detecção falhar ou não achar rosto num frame com pessoas de verdade nele,
@@ -321,7 +355,7 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
     "fail-safe" usado em `_frame_fallback_seguro` (que preferia pixelizar tudo
     a arriscar vazar um rosto).
     """
-    intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
+    intervalo = 1.0 / min(max(1, config.STREAM_TARGET_FPS), _STREAM_BRUTO_FPS_MAXIMO)
     inicio_espera = time.monotonic()
     teve_frame = False
 
@@ -329,50 +363,70 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
     contador_frames = 0
     ultimas_boxes: List[Tuple[int, int, int, int]] = []
 
-    while True:
-        frame = _ler_frame_bruto_fresco(camera_id)
-        if frame is None:
-            if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
-                logger.warning(
-                    "[camera %s] nenhum frame bruto em %.0fs — encerrando streaming direto deste viewer.",
-                    camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
-                )
+    try:
+        while True:
+            if parar_eventualmente is not None and parar_eventualmente.is_set():
+                logger.info("[camera %s] cliente desconectou — encerrando streaming direto deste viewer.", camera_id)
                 return
-            time.sleep(0.1)
-            continue
 
-        if not teve_frame:
-            logger.info("[camera %s] primeiro frame BRUTO (bypass) entregue a um viewer.", camera_id)
-        teve_frame = True
-
-        try:
-            if cascade is not None and contador_frames % _DETECCAO_A_CADA_N_FRAMES == 0:
-                ultimas_boxes = _detectar_rostos_cascade(cascade, frame)
-            contador_frames += 1
-
-            saida = frame
-            if ultimas_boxes:
-                saida = frame.copy()
-                for x1, y1, x2, y2 in ultimas_boxes:
-                    VideoProcessor._blur_regiao(saida, x1, y1, x2, y2)
-
-            ok, buffer = cv2.imencode(".jpg", saida, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
-        except Exception:
-            # Qualquer falha pontual no cascade/resize/encode: entrega o frame
-            # BRUTO (sem blur) e segue pro próximo — nunca trava o generator.
-            logger.exception("[camera %s] falha ao processar frame no caminho direto — entregando frame bruto.", camera_id)
-            try:
-                ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
-            except Exception:
-                # Se até isso falhar (frame corrompido de alguma forma), só
-                # pula este frame — segue pro próximo, nunca trava o generator.
-                logger.exception("[camera %s] fallback de frame bruto TAMBÉM falhou — pulando este frame.", camera_id)
-                time.sleep(intervalo)
+            frame = _ler_frame_bruto_fresco(camera_id)
+            if frame is None:
+                if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
+                    logger.warning(
+                        "[camera %s] nenhum frame bruto em %.0fs — encerrando streaming direto deste viewer.",
+                        camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
+                    )
+                    return
+                time.sleep(0.1)
                 continue
 
-        if ok:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
-        time.sleep(intervalo)
+            if not teve_frame:
+                logger.info("[camera %s] primeiro frame BRUTO (bypass) entregue a um viewer.", camera_id)
+            teve_frame = True
+
+            try:
+                if cascade is not None and contador_frames % _DETECCAO_A_CADA_N_FRAMES == 0:
+                    ultimas_boxes = _detectar_rostos_cascade(cascade, frame)
+                contador_frames += 1
+
+                saida = frame
+                if ultimas_boxes:
+                    saida = frame.copy()
+                    for x1, y1, x2, y2 in ultimas_boxes:
+                        VideoProcessor._blur_regiao(saida, x1, y1, x2, y2)
+
+                ok, buffer = cv2.imencode(".jpg", saida, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
+            except Exception:
+                # Qualquer falha pontual no cascade/resize/encode: entrega o frame
+                # BRUTO (sem blur) e segue pro próximo — nunca trava o generator.
+                logger.exception("[camera %s] falha ao processar frame no caminho direto — entregando frame bruto.", camera_id)
+                try:
+                    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
+                except Exception:
+                    # Se até isso falhar (frame corrompido de alguma forma), só
+                    # pula este frame — segue pro próximo, nunca trava o generator.
+                    logger.exception("[camera %s] fallback de frame bruto TAMBÉM falhou — pulando este frame.", camera_id)
+                    time.sleep(intervalo)
+                    continue
+
+            if ok:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
+
+            if contador_frames % _GC_A_CADA_N_FRAMES == 0:
+                # Libera os numpy arrays intermediários (resize/cvtColor/blur/
+                # imencode) que se acumulam na geração 0 do GC durante o stream
+                # contínuo — ver docstring de `_GC_A_CADA_N_FRAMES`.
+                gc.collect()
+
+            time.sleep(intervalo)
+    finally:
+        # Cobre tanto o `return` explícito acima quanto o generator sendo
+        # fechado de fora (GeneratorExit, entregue no `yield` quando o
+        # StreamingResponse do FastAPI detecta que o cliente sumiu e chama
+        # `.close()` no generator) — em ambos os casos, loga que este viewer
+        # de fato liberou os recursos (cascade local, boxes em memória) em vez
+        # de ficar rodando pra sempre num viewer fantasma.
+        logger.info("[camera %s] streaming direto (bypass) encerrado para este viewer — recursos liberados.", camera_id)
 
 
 class BrowserPushStream:
@@ -1198,7 +1252,22 @@ class VideoProcessor:
         return pixelizado
 
     # -------------------- pipeline por frame --------------------
-    def processar_frame(self, frame: np.ndarray) -> np.ndarray:
+    def processar_frame(self, frame: np.ndarray, gerar_saida_visual: bool = True) -> np.ndarray:
+        """
+        `gerar_saida_visual=False` pula os passos 1 e 5 (anonimização + overlays
+        de zonas/pessoas) — usados só para o JPEG de saída de `generate_mjpeg`.
+        Câmeras de webcam do navegador não consomem mais esse JPEG (o
+        `/video_feed` delas usa `gerar_mjpeg_bruto_com_blur`, um caminho
+        totalmente separado — ver `_loop_processamento`), então rodar
+        anonimização (que inclui detecção facial via MediaPipe — o mesmo
+        componente que estava derrubando o worker no Render, ver histórico
+        deste arquivo) e desenhar overlays pra um frame que ninguém nunca lê é
+        CPU/memória jogada fora, e cada trabalho a mais aqui roda continuamente
+        em background pra TODA câmera, o tempo todo — um contribuinte real pro
+        esgotamento de recursos que derrubava o sistema depois de alguns
+        minutos. A análise (detecção + rastreamento + lógica de perfil) abaixo
+        continua rodando sempre — é isso que alimenta fila/atendimento/etc.
+        """
         h, w = frame.shape[:2]
         agora = time.monotonic()
         dt = 0.0 if self._ultimo_frame_processado_em is None else max(0.0, agora - self._ultimo_frame_processado_em)
@@ -1211,7 +1280,8 @@ class VideoProcessor:
         }
 
         # 1) Anonimização SEMPRE antes de qualquer desenho/exposição do frame (LGPD)
-        self._anonimizar(frame, boxes)
+        if gerar_saida_visual:
+            self._anonimizar(frame, boxes)
 
         # 2) Bookkeeping de rastreamento (posição/movimento/célula do grid)
         self._atualizar_estado_tracks(pessoas, centros, agora, dt)
@@ -1229,6 +1299,8 @@ class VideoProcessor:
         self._atualizar_ocupacao_periodica(pessoas, agora)
 
         # 5) Overlays visuais
+        if not gerar_saida_visual:
+            return frame
         self._desenhar_zonas(frame)
         self._desenhar_pessoas(frame, pessoas)
 
@@ -1299,6 +1371,16 @@ class VideoProcessor:
         """
         self._carregar_modelo()  # eager, em paralelo com a conexão da fonte — ver docstring do método
         intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
+
+        # Câmeras de webcam do navegador não usam mais o JPEG que esta thread
+        # produziria (o `/video_feed` delas é `gerar_mjpeg_bruto_com_blur`, um
+        # caminho separado) — pula anonimização/overlays/encode/buffer pra
+        # elas (ver docstring de `processar_frame`). Fixo pra vida do processo:
+        # o tipo de `self.stream` não muda depois de `__init__`.
+        precisa_saida_visual = not isinstance(self.stream, BrowserPushStream)
+
+        contador_frames = 0
+
         while self._rodando:
             inicio = time.monotonic()
             self._atualizar_status_camera(self.stream.connected)
@@ -1311,41 +1393,51 @@ class VideoProcessor:
 
             self._ultima_leitura_ok_em = inicio
             self._estado_resetado_por_desconexao = False
+            contador_frames += 1
 
             try:
-                processado = self.processar_frame(frame)
+                processado = self.processar_frame(frame, gerar_saida_visual=precisa_saida_visual)
             except Exception:
                 # Uma falha pontual (ex.: frame corrompido) não pode derrubar a
                 # thread de processamento da câmera — loga com stack trace completo
                 # (antes era silencioso — uma falha recorrente aqui produzia
                 # exatamente o mesmo sintoma de "tela preta sem explicação" que a
-                # desconexão da câmera, sem nenhum log pra diferenciar as duas) e
-                # tenta servir um frame de fallback SEGURO (pixelizado por inteiro,
-                # não depende de nenhuma detecção ter funcionado — ver docstring de
-                # `_frame_fallback_seguro`) em vez de deixar o buffer de saída sem
-                # nenhum frame novo. Só se ATÉ o fallback falhar (bem improvável,
-                # já que ele só faz resize) é que o frame é mesmo descartado.
-                logger.exception(
-                    "[camera %s] falha ao processar frame — servindo fallback pixelizado (LGPD-safe) neste frame.",
-                    self.camera_id,
-                )
+                # desconexão da câmera, sem nenhum log pra diferenciar as duas).
+                logger.exception("[camera %s] falha ao processar frame.", self.camera_id)
+                if not precisa_saida_visual:
+                    # Ninguém lê `_ultimo_jpeg` desta câmera — não vale a pena
+                    # gastar CPU/memória com o fallback pixelizado, só segue.
+                    time.sleep(max(0.0, intervalo - (time.monotonic() - inicio)))
+                    continue
+                # Tenta servir um frame de fallback SEGURO (pixelizado por
+                # inteiro, não depende de nenhuma detecção ter funcionado — ver
+                # docstring de `_frame_fallback_seguro`) em vez de deixar o
+                # buffer de saída sem nenhum frame novo. Só se ATÉ o fallback
+                # falhar é que o frame é mesmo descartado.
                 try:
                     processado = self._frame_fallback_seguro(frame)
                 except Exception:
                     logger.exception("[camera %s] fallback de frame pixelizado TAMBÉM falhou — pulando este frame.", self.camera_id)
                     continue
 
-            ok, buffer = cv2.imencode(
-                ".jpg", processado, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY]
-            )
-            if ok:
-                with self._frame_lock:
-                    self._ultimo_jpeg = buffer.tobytes()
+            if precisa_saida_visual:
+                ok, buffer = cv2.imencode(
+                    ".jpg", processado, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY]
+                )
+                if ok:
+                    with self._frame_lock:
+                        self._ultimo_jpeg = buffer.tobytes()
+
+            if contador_frames % _GC_A_CADA_N_FRAMES == 0:
+                # Libera os buffers numpy/JPEG intermediários que se acumulam
+                # durante o processamento contínuo — mesmo racional de
+                # `gerar_mjpeg_bruto_com_blur` (ver `_GC_A_CADA_N_FRAMES`).
+                gc.collect()
 
             decorrido = time.monotonic() - inicio
             time.sleep(max(0.0, intervalo - decorrido))
 
-    def generate_mjpeg(self):
+    def generate_mjpeg(self, parar_eventualmente: Optional[threading.Event] = None):
         """
         Consumidor puro (um por viewer HTTP): só lê o último JPEG já processado.
         Não roda IA — ver docstring do módulo sobre a thread de processamento dedicada.
@@ -1360,31 +1452,43 @@ class VideoProcessor:
         sabe mostrar "Falha ao conectar à câmera" + botão de retry. Depois do
         primeiro frame, o timeout deixa de valer — reconexões subsequentes usam a
         resiliência normal do CameraStream.
+
+        `parar_eventualmente`: mesmo mecanismo de `gerar_mjpeg_bruto_com_blur`
+        — `routes.video_feed` seta esse `threading.Event` assim que detecta que
+        o cliente HTTP desconectou, e este generator encerra no próximo frame
+        em vez de continuar rodando indefinidamente para um viewer fantasma.
         """
         intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
         inicio_espera = time.monotonic()
         teve_frame = False
-        while True:
-            with self._frame_lock:
-                jpeg = self._ultimo_jpeg
-            if jpeg is None:
-                if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
-                    logger.warning(
-                        "[camera %s] nenhum frame em %.0fs — encerrando o streaming deste viewer.",
-                        self.camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
-                    )
+        try:
+            while True:
+                if parar_eventualmente is not None and parar_eventualmente.is_set():
+                    logger.info("[camera %s] cliente desconectou — encerrando streaming deste viewer.", self.camera_id)
                     return
-                time.sleep(0.1)
-                continue
 
-            if not teve_frame:
-                logger.info(
-                    "[camera %s] primeiro frame entregue a um viewer após %.1fs de espera.",
-                    self.camera_id, time.monotonic() - inicio_espera,
-                )
-            teve_frame = True
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
-            time.sleep(intervalo)
+                with self._frame_lock:
+                    jpeg = self._ultimo_jpeg
+                if jpeg is None:
+                    if not teve_frame and (time.monotonic() - inicio_espera) > config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS:
+                        logger.warning(
+                            "[camera %s] nenhum frame em %.0fs — encerrando o streaming deste viewer.",
+                            self.camera_id, config.CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS,
+                        )
+                        return
+                    time.sleep(0.1)
+                    continue
+
+                if not teve_frame:
+                    logger.info(
+                        "[camera %s] primeiro frame entregue a um viewer após %.1fs de espera.",
+                        self.camera_id, time.monotonic() - inicio_espera,
+                    )
+                teve_frame = True
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+                time.sleep(intervalo)
+        finally:
+            logger.info("[camera %s] streaming encerrado para este viewer — recursos liberados.", self.camera_id)
 
     def stop(self) -> None:
         self._rodando = False
