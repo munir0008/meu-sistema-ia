@@ -8,8 +8,10 @@ import logging
 import threading
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import BACKEND_URL, CORS_ORIGINS, YOLO_MODEL_PATH
 from database import init_db, seed_super_admin
@@ -32,6 +34,7 @@ from vision import camera_manager
 # "camera_ingest conectado" e "primeiro frame entregue" aparecerem com PIDs
 # diferentes para a mesma câmera, é exatamente isso.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [pid=%(process)d] %(name)s: %(message)s")
+logger = logging.getLogger("main")
 
 app = FastAPI(
     title="Plataforma SaaS de Inteligência Operacional por Câmeras",
@@ -51,6 +54,46 @@ app = FastAPI(
 ORIGENS_SEMPRE_PERMITIDAS = ["https://meu-sistema-ia.vercel.app"]
 
 _origens_permitidas = sorted(set(CORS_ORIGINS) | set(ORIGENS_SEMPRE_PERMITIDAS))
+
+
+class TratamentoGlobalDeExcecoes(BaseHTTPMiddleware):
+    """
+    Rede de segurança: qualquer exceção não tratada por uma rota (bug real,
+    erro inesperado) vira um 500 em JSON consistente (`{"detail": "..."}`),
+    com stack trace completo no log — em vez de propagar crua. Um request já
+    NÃO derrubava o processo uvicorn antes disso (o Starlette sempre embrulha
+    cada request e devolve 500 de qualquer forma); o ganho real aqui é um
+    corpo de resposta previsível pro frontend tratar e o log centralizado.
+
+    Implementado como MIDDLEWARE comum (não `@app.exception_handler(Exception)`)
+    de propósito: um exception_handler registrado pra `Exception` fica preso na
+    `ServerErrorMiddleware` do Starlette, que é sempre a camada MAIS externa —
+    por FORA do CORSMiddleware. A resposta que ela gera nunca passa pelo
+    CORSMiddleware no caminho de volta, então o navegador do frontend BLOQUEIA
+    a leitura por falta do header `Access-Control-Allow-Origin` — o 500 vira,
+    pro usuário, uma falha silenciosa sem corpo nenhum visível (exatamente o
+    tipo de sintoma "várias abas param ao mesmo tempo, sem explicação" que
+    motivou essa mudança, e o mesmo tipo de armadilha de CORS que este projeto
+    já enfrentou uma vez — ver ORIGENS_SEMPRE_PERMITIDAS acima). Como
+    middleware comum registrado ANTES do CORSMiddleware (`add_middleware`
+    insere no INÍCIO da pilha — quem é adicionado por último fica mais
+    externo, então isto precisa vir antes no código pra ficar por DENTRO do
+    CORS), a resposta que devolvo passa pelo CORSMiddleware normalmente no
+    caminho de volta e ganha os headers de CORS como qualquer resposta comum.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.exception("Exceção não tratada em %s %s", request.method, request.url.path)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Erro interno no servidor. Tente novamente em instantes."},
+            )
+
+
+app.add_middleware(TratamentoGlobalDeExcecoes)
 
 app.add_middleware(
     CORSMiddleware,
