@@ -20,8 +20,17 @@ const ALTURA = 480;
  * Fica montado enquanto a página estiver aberta: é essa aba do navegador que
  * atua como "ponte" entre a webcam física e o backend na nuvem — se ela
  * fechar, o feed para (ver CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS no backend).
+ *
+ * `onEnviando` (opcional) é chamado toda vez que o WebSocket de envio abre —
+ * o sinal mais cedo possível de "frames estão chegando no backend agora".
+ * Quem renderiza o <img> do /video_feed (CameraCard, ZoneEditor) usa isso pra
+ * recarregar a imagem na hora, em vez de depender só do onError/retry: sem
+ * isso, se o <img> tivesse sido montado ANTES desta câmera começar a mandar
+ * frames (corrida comum logo ao abrir a página — pedir permissão de câmera
+ * ao usuário não é instantâneo), o pedido de vídeo já teria estourado o
+ * timeout do backend e fechado, e o navegador nunca tentaria de novo sozinho.
  */
-export default function WebcamCapturePusher({ camera }) {
+export default function WebcamCapturePusher({ camera, onEnviando }) {
   const [status, setStatus] = useState("conectando"); // conectando | enviando | erro
   const [mensagemErro, setMensagemErro] = useState(null);
 
@@ -72,7 +81,10 @@ export default function WebcamCapturePusher({ camera }) {
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        if (!cancelado) setStatus("enviando");
+        if (!cancelado) {
+          setStatus("enviando");
+          onEnviando?.();
+        }
       };
       ws.onclose = () => {
         if (!cancelado) setStatus("conectando");

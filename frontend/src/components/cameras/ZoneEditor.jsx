@@ -1,10 +1,12 @@
-import { Check, RotateCcw, Trash2, X } from "lucide-react";
-import { useRef, useState } from "react";
+import { Check, RefreshCw, RotateCcw, Trash2, VideoOff } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { getVideoFeedUrl } from "../../api/cameras";
 import Button from "../ui/Button";
 import Select from "../ui/Select";
 import { TIPO_ZONA_CORES, TIPO_ZONA_LABELS } from "../../utils/format";
 import WebcamCapturePusher from "./WebcamCapturePusher";
+
+const RETRY_AUTOMATICO_MS = 5000;
 
 /**
  * Editor de zonas de interesse: desenha polígonos normalizados (0.0–1.0) sobre
@@ -22,6 +24,24 @@ export default function ZoneEditor({ camera, zonas, onChangeZonas }) {
   const containerRef = useRef(null);
   const [tipoSelecionado, setTipoSelecionado] = useState("atendente");
   const [pontosAtuais, setPontosAtuais] = useState([]);
+
+  // Sem isso, um <img> que falhasse (ex.: montado antes da câmera começar a
+  // mandar frame — ver WebcamCapturePusher) ficava preto pra sempre: não
+  // havia onError nem forma de recarregar, então a única saída era fechar e
+  // reabrir a aba de zonas.
+  const [streamKey, setStreamKey] = useState(0);
+  const [comErro, setComErro] = useState(false);
+
+  function reconectar() {
+    setComErro(false);
+    setStreamKey((k) => k + 1);
+  }
+
+  useEffect(() => {
+    if (!comErro) return undefined;
+    const t = setTimeout(reconectar, RETRY_AUTOMATICO_MS);
+    return () => clearTimeout(t);
+  }, [comErro]);
 
   function handleClickImagem(e) {
     const rect = containerRef.current.getBoundingClientRect();
@@ -73,14 +93,36 @@ export default function ZoneEditor({ camera, zonas, onChangeZonas }) {
         &quot;Finalizar zona&quot;.
       </p>
 
-      <WebcamCapturePusher camera={camera} />
+      <WebcamCapturePusher camera={camera} onEnviando={reconectar} />
 
       <div
         ref={containerRef}
         onClick={handleClickImagem}
         className="relative aspect-video w-full cursor-crosshair overflow-hidden rounded-lg border border-neutral-300 bg-black dark:border-neutral-800"
       >
-        <img src={getVideoFeedUrl(cameraId)} alt="Referência para desenho de zonas" className="pointer-events-none h-full w-full object-contain" />
+        {!comErro && (
+          <img
+            key={streamKey}
+            src={getVideoFeedUrl(cameraId)}
+            alt="Referência para desenho de zonas"
+            className="pointer-events-none h-full w-full object-contain"
+            onError={() => setComErro(true)}
+          />
+        )}
+
+        {comErro && (
+          <div className="pointer-events-none flex h-full w-full flex-col items-center justify-center gap-2 text-neutral-600">
+            <VideoOff className="size-6" />
+            <span className="text-xs">Falha ao conectar à câmera</span>
+            <button
+              onClick={reconectar}
+              className="pointer-events-auto mt-1 flex items-center gap-1.5 rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+            >
+              <RefreshCw className="size-3.5" />
+              Tentar novamente
+            </button>
+          </div>
+        )}
 
         <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full">
           {zonas.map((zona, i) => (

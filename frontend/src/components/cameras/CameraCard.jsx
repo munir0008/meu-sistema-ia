@@ -1,9 +1,11 @@
 import { RefreshCw, VideoOff } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { getVideoFeedUrl } from "../../api/cameras";
 import Badge from "../ui/Badge";
 import { PERFIL_CAMERA_LABELS } from "../../utils/format";
 import WebcamCapturePusher from "./WebcamCapturePusher";
+
+const RETRY_AUTOMATICO_MS = 5000;
 
 export default function CameraCard({ camera }) {
   const [streamKey, setStreamKey] = useState(0);
@@ -14,6 +16,16 @@ export default function CameraCard({ camera }) {
     setComErro(false);
     setStreamKey((k) => k + 1);
   }
+
+  // Auto-retry: cobre o caso comum de o <img> ter sido montado ANTES da
+  // câmera (ex.: webcam do navegador, ver WebcamCapturePusher) começar a
+  // mandar frame — sem isso, o usuário ficaria preso na tela de erro até
+  // clicar "Tentar novamente" na mão, mesmo com o feed já disponível.
+  useEffect(() => {
+    if (!comErro) return undefined;
+    const t = setTimeout(reconectar, RETRY_AUTOMATICO_MS);
+    return () => clearTimeout(t);
+  }, [comErro]);
 
   return (
     <div className="overflow-hidden rounded-xl border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900/60">
@@ -73,7 +85,7 @@ export default function CameraCard({ camera }) {
         <Badge tone="cyan">Câmera #{camera.id}</Badge>
       </div>
 
-      <WebcamCapturePusher camera={camera} />
+      <WebcamCapturePusher camera={camera} onEnviando={reconectar} />
     </div>
   );
 }

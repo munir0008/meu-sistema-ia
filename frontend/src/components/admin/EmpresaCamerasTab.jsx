@@ -29,15 +29,22 @@ export default function EmpresaCamerasTab({ empresaId }) {
   const [salvandoZonas, setSalvandoZonas] = useState(false);
   const [erroZonas, setErroZonas] = useState(null);
 
-  async function carregar() {
-    setCarregando(true);
-    setErro(null);
+  // `comSpinner=false` é usado pelo polling em segundo plano (ver useEffect
+  // abaixo): sem essa distinção, o status.online/offline do badge (atualizado
+  // pelo backend em tempo real conforme a câmera conecta — ver vision.py)
+  // nunca chegaria na tela sem um F5, e a cada 5s a lista inteira piscaria
+  // um spinner por cima de quem está desenhando zonas.
+  async function carregar({ comSpinner = true } = {}) {
+    if (comSpinner) {
+      setCarregando(true);
+      setErro(null);
+    }
     try {
       setCameras(await camerasApi.listarCameras(empresaId));
     } catch (err) {
-      setErro(err?.response?.data?.detail || "Não foi possível carregar as câmeras.");
+      if (comSpinner) setErro(err?.response?.data?.detail || "Não foi possível carregar as câmeras.");
     } finally {
-      setCarregando(false);
+      if (comSpinner) setCarregando(false);
     }
   }
 
@@ -45,6 +52,8 @@ export default function EmpresaCamerasTab({ empresaId }) {
     setCameraExpandida(null);
     setZonasPorCamera({});
     carregar();
+    const intervalo = setInterval(() => carregar({ comSpinner: false }), 5_000);
+    return () => clearInterval(intervalo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [empresaId]);
 
