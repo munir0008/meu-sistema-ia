@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 import threading
 import time
@@ -184,11 +185,14 @@ FONTE_WEBCAM_NAVEGADOR = "browser"
 # `routes.camera_ingest` grava aqui, direto, o frame que acabou de decodificar
 # — sem fila, sem thread própria, um dict global protegido por lock só. E
 # `/api/video_feed` (para câmera de navegador) lê daqui e serve com blur
-# aplicado só nas bounding boxes de rosto detectadas (MediaPipe leve, isolado
-# por try/except — ver `gerar_mjpeg_bruto_com_blur`), nunca no frame inteiro.
-# Nada aqui passa perto do YOLO: se o problema estiver em QUALQUER parte do
-# pipeline de IA pesado, esse caminho continua funcionando porque não depende
-# dele.
+# aplicado só nas bounding boxes de rosto detectadas por um Haar Cascade
+# nativo do OpenCV — ver `gerar_mjpeg_bruto_com_blur`. MediaPipe foi
+# abandonado aqui: em produção (Render) sua inicialização/inferência estava
+# lançando (ou, pior, o processo native podia derrubar o worker inteiro sem
+# nem passar por um `except` do Python — um C++ crash não é capturável),
+# deixando o buffer de saída vazio de novo (tela preta). CascadeClassifier é
+# puro OpenCV (mesma lib que já sustenta o resto do módulo), sem processo
+# nativo separado nem dependência externa nova.
 #
 # Isso é ADICIONAL ao pipeline de IA existente, não uma substituição: o ingest
 # continua chamando `BrowserPushStream.push_frame` normalmente logo em
@@ -197,6 +201,36 @@ FONTE_WEBCAM_NAVEGADOR = "browser"
 # depender mais dela.
 _ULTIMO_FRAME_BRUTO: Dict[int, Tuple[np.ndarray, float]] = {}
 _ULTIMO_FRAME_BRUTO_LOCK = threading.Lock()
+
+# XML do Haar Cascade BUNDLADO no repo (backend/haarcascade_frontalface_default.xml)
+# em vez de referenciar cv2.data.haarcascades: confirmado em dev que pelo menos
+# uma versão recente de opencv-python-headless (5.0.0.93, puxada por
+# `opencv-python-headless>=4.9.0.80` sem teto de versão) NÃO inclui os XMLs de
+# haarcascade no pacote — cv2.data.haarcascades aponta pra uma pasta vazia
+# nesse caso, o que deixaria o CascadeClassifier permanentemente `.empty()`
+# (detectMultiScale levantaria cv2.error em TODO frame). Um arquivo próprio,
+# versionado no git, não depende de qual versão do pacote foi instalada.
+_HAARCASCADE_ROSTO_PATH = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
+
+# Detecção só a cada N frames — reaproveita as boxes do último frame
+# detectado nos frames intermediários (ver `gerar_mjpeg_bruto_com_blur`).
+# Reduz o custo de CPU do stream ao vivo sem perder a resposta visual do blur
+# seguindo o rosto (a ~STREAM_TARGET_FPS fps, 1 detecção a cada 4 frames ainda
+# é bem mais que suficiente pra acompanhar movimento normal de webcam).
+_DETECCAO_A_CADA_N_FRAMES = 4
+
+# Resolução usada SÓ para o CÁLCULO do detector — quanto maior o frame de
+# entrada, mais caro o Haar Cascade (ele varre em múltiplas escalas). O frame
+# de SAÍDA continua na resolução original; as boxes encontradas são escaladas
+# de volta proporcionalmente antes do blur (ver `_escalar_boxes`).
+_DETECCAO_LARGURA_MAX = 480
+
+# Qualidade JPEG deste stream direto — mais agressiva que o padrão do resto do
+# pipeline (`config.STREAM_JPEG_QUALITY`, tipicamente 80) porque aqui o
+# gargalo é a rede (navegador → backend → navegador do viewer), não a
+# qualidade da IA: 50-60 já é imperceptível a olho nu num stream ao vivo e
+# reduz bastante o peso de cada frame transferido.
+_STREAM_BRUTO_JPEG_QUALITY = 55
 
 
 def armazenar_frame_bruto(camera_id: int, frame: np.ndarray) -> None:
@@ -218,35 +252,46 @@ def _ler_frame_bruto_fresco(camera_id: int) -> Optional[np.ndarray]:
     return frame.copy()
 
 
-def _detectar_rostos_isolado(detector_facial, frame: np.ndarray):
+def _carregar_cascade_rosto():
     """
-    Roda o detector de rosto (MediaPipe) num frame e devolve a lista de
-    bounding boxes em pixel — ou `None` se a detecção falhar. Deliberadamente
-    a ÚNICA coisa que pode lançar aqui é a chamada ao modelo em si: qualquer
-    exceção (modelo não carrega, frame incompatível, etc.) é isolada nesta
-    função e vira `None` pro chamador, que decide o que fazer (ver
-    `gerar_mjpeg_bruto_com_blur`) — nunca propaga pra derrubar o streaming
-    nem pra justificar borrar o frame inteiro.
+    Carrega o Haar Cascade a partir do XML bundlado no repo (ver
+    `_HAARCASCADE_ROSTO_PATH`). Nativo do OpenCV — sem processo/lib externa,
+    sem exceção esperada em uso normal — mas ainda assim isolado em
+    try/except: se o arquivo não existir ou estiver corrompido, o streaming
+    segue sem blur (nunca derruba nada) em vez de travar a conexão do viewer.
     """
     try:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resultado = detector_facial.process(rgb)
+        cascade = cv2.CascadeClassifier(_HAARCASCADE_ROSTO_PATH)
+        if cascade.empty():
+            logger.error("Haar Cascade não carregou (%s) — streaming seguirá sem blur.", _HAARCASCADE_ROSTO_PATH)
+            return None
+        return cascade
     except Exception:
-        logger.exception("detector de rosto lançou exceção ao processar o frame.")
+        logger.exception("Falha ao carregar Haar Cascade (%s) — streaming seguirá sem blur.", _HAARCASCADE_ROSTO_PATH)
         return None
 
-    if not resultado.detections:
+
+def _detectar_rostos_cascade(cascade, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """
+    Roda o Haar Cascade numa versão REDUZIDA do frame (≤ `_DETECCAO_LARGURA_MAX`
+    de largura — o Cascade é bem mais rápido nessa resolução) e devolve as
+    bounding boxes já escaladas de volta pras coordenadas do frame ORIGINAL.
+    Lista vazia = nenhum rosto encontrado (frame sai limpo, sem blur).
+    """
+    h, w = frame.shape[:2]
+    escala = min(1.0, _DETECCAO_LARGURA_MAX / w)
+    pequeno = cv2.resize(frame, (max(1, int(w * escala)), max(1, int(h * escala)))) if escala < 1.0 else frame
+    cinza = cv2.cvtColor(pequeno, cv2.COLOR_BGR2GRAY)
+
+    deteccoes = cascade.detectMultiScale(cinza, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24))
+
+    if len(deteccoes) == 0:
         return []
 
-    h, w = frame.shape[:2]
+    inv = 1.0 / escala
     boxes = []
-    for det in resultado.detections:
-        bbox = det.location_data.relative_bounding_box
-        x1 = int(bbox.xmin * w)
-        y1 = int(bbox.ymin * h)
-        x2 = int((bbox.xmin + bbox.width) * w)
-        y2 = int((bbox.ymin + bbox.height) * h)
-        boxes.append((x1, y1, x2, y2))
+    for x, y, bw, bh in deteccoes:
+        boxes.append((int(x * inv), int(y * inv), int((x + bw) * inv), int((y + bh) * inv)))
     return boxes
 
 
@@ -254,39 +299,35 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
     """
     Generator MJPEG DEFINITIVO para câmera de navegador: lê o último frame de
     `_ULTIMO_FRAME_BRUTO` e entrega, sem YOLO, sem thread de VideoProcessor,
-    sem fila — só um detector de rosto leve (MediaPipe FaceDetection,
-    instanciado uma vez por conexão) rodando aqui mesmo, nesta thread do
-    generator (uma por viewer, então sem necessidade de lock nele).
+    sem fila — só um Haar Cascade de rosto nativo do OpenCV (instanciado uma
+    vez por conexão, nesta thread do generator — uma por viewer, sem
+    necessidade de lock).
 
     O blur é aplicado EXCLUSIVAMENTE sobre a bounding box de cada rosto
-    detectado com sucesso — nunca no frame inteiro. Se o detector não achar
-    nenhum rosto OU lançar uma exceção pontual (isolada em
-    `_detectar_rostos_isolado`, que nunca deixa essa exceção vazar até aqui),
-    o frame sai LIMPO, sem blur nenhum: uma falha do detector não pode nunca
-    resultar em pixelizar a tela inteira.
+    detectado — nunca no frame inteiro. Sem rosto encontrado (ou cascade que
+    não carregou) = frame sai LIMPO. A detecção só roda a cada
+    `_DETECCAO_A_CADA_N_FRAMES` frames (as boxes do último resultado são
+    reaproveitadas nos intermediários) e numa versão reduzida do frame (ver
+    `_DETECCAO_LARGURA_MAX`) — ambos pra manter o FPS do stream ao vivo sem
+    pesar a CPU a cada frame recebido.
 
-    Aviso de LGPD: isso é uma troca deliberada pedida explicitamente — se o
-    detector falhar num frame com pessoas de verdade nele, esse frame
-    específico sai SEM anonimização (não borrado). Divergem aqui do padrão
-    "fail-safe" usado em `_frame_fallback_seguro` (que preferia pixelizar
-    tudo a arriscar vazar um rosto). Se isso virar recorrente nos logs
-    ("detector de rosto lançou exceção"), vale revisitar essa troca.
+    O corpo do loop inteiro roda dentro de um try/except: qualquer falha
+    pontual (cascade, resize, encode, o que for) faz o frame BRUTO (sem blur)
+    ser entregue e o loop segue pro próximo — nunca trava o generator.
+
+    Aviso de LGPD: isso é uma troca deliberada pedida explicitamente — se a
+    detecção falhar ou não achar rosto num frame com pessoas de verdade nele,
+    esse frame sai SEM anonimização (não borrado). Divergem aqui do padrão
+    "fail-safe" usado em `_frame_fallback_seguro` (que preferia pixelizar tudo
+    a arriscar vazar um rosto).
     """
     intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
     inicio_espera = time.monotonic()
     teve_frame = False
 
-    detector_facial = None
-    try:
-        import mediapipe as mp
-
-        detector_facial = mp.solutions.face_detection.FaceDetection(
-            model_selection=0, min_detection_confidence=0.5
-        )
-    except Exception:
-        # Nem a CRIAÇÃO do detector pode derrubar o streaming — sem detector,
-        # todo frame simplesmente sai limpo (ver uso de `detector_facial` abaixo).
-        logger.exception("[camera %s] falha ao inicializar o detector de rosto — streaming seguirá sem blur.", camera_id)
+    cascade = _carregar_cascade_rosto()
+    contador_frames = 0
+    ultimas_boxes: List[Tuple[int, int, int, int]] = []
 
     while True:
         frame = _ler_frame_bruto_fresco(camera_id)
@@ -304,14 +345,31 @@ def gerar_mjpeg_bruto_com_blur(camera_id: int):
             logger.info("[camera %s] primeiro frame BRUTO (bypass) entregue a um viewer.", camera_id)
         teve_frame = True
 
-        saida = frame
-        boxes = _detectar_rostos_isolado(detector_facial, frame) if detector_facial is not None else None
-        if boxes:
-            saida = frame.copy()
-            for x1, y1, x2, y2 in boxes:
-                VideoProcessor._blur_regiao(saida, x1, y1, x2, y2)
+        try:
+            if cascade is not None and contador_frames % _DETECCAO_A_CADA_N_FRAMES == 0:
+                ultimas_boxes = _detectar_rostos_cascade(cascade, frame)
+            contador_frames += 1
 
-        ok, buffer = cv2.imencode(".jpg", saida, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY])
+            saida = frame
+            if ultimas_boxes:
+                saida = frame.copy()
+                for x1, y1, x2, y2 in ultimas_boxes:
+                    VideoProcessor._blur_regiao(saida, x1, y1, x2, y2)
+
+            ok, buffer = cv2.imencode(".jpg", saida, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
+        except Exception:
+            # Qualquer falha pontual no cascade/resize/encode: entrega o frame
+            # BRUTO (sem blur) e segue pro próximo — nunca trava o generator.
+            logger.exception("[camera %s] falha ao processar frame no caminho direto — entregando frame bruto.", camera_id)
+            try:
+                ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _STREAM_BRUTO_JPEG_QUALITY])
+            except Exception:
+                # Se até isso falhar (frame corrompido de alguma forma), só
+                # pula este frame — segue pro próximo, nunca trava o generator.
+                logger.exception("[camera %s] fallback de frame bruto TAMBÉM falhou — pulando este frame.", camera_id)
+                time.sleep(intervalo)
+                continue
+
         if ok:
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
         time.sleep(intervalo)
