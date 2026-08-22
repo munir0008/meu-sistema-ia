@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FONTE_WEBCAM_NAVEGADOR, getCameraIngestWsUrl } from "../../api/cameras";
 
 const INTERVALO_ENVIO_MS = 200; // ~5 fps de upload — o backend só reaproveita o frame mais recente
@@ -14,36 +14,48 @@ const ALTURA = 480;
  * frente que precisa capturar (getUserMedia) e empurrar os frames pro backend
  * via WebSocket (/api/camera_ingest). O <img> que exibe o resultado processado
  * (blur/zonas/overlay) continua vindo do /api/video_feed normal — este
- * componente só cuida do envio, não renderiza vídeo nenhum (por isso não some
- * da tela, mas também não ocupa espaço visual além do indicador de status).
+ * componente só cuida do envio.
+ *
+ * O <video> PRECISA estar de fato montado no DOM (não só criado em memória
+ * com `document.createElement`) — em vários navegadores, principalmente
+ * mobile, um <video> desanexado nunca avança o `readyState` de forma
+ * confiável mesmo com a permissão concedida e a captura ativa (o ícone de
+ * gravação da aba liga, mas o elemento nunca decodifica frame nenhum). Sem
+ * isso, o loop de envio abaixo (que só desenha no canvas quando
+ * `readyState >= 2`) nunca chega a rodar de verdade — e o pior: o WebSocket
+ * abre normalmente, então o status antigo ("enviando", baseado só no
+ * `ws.onopen`) mentia que estava tudo bem enquanto nenhum frame saía. Por
+ * isso "enviando" aqui só é reportado depois do PRIMEIRO envio real.
  *
  * Fica montado enquanto a página estiver aberta: é essa aba do navegador que
  * atua como "ponte" entre a webcam física e o backend na nuvem — se ela
  * fechar, o feed para (ver CAMERA_NAVEGADOR_FRAME_TIMEOUT_SEGUNDOS no backend).
  *
- * `onEnviando` (opcional) é chamado toda vez que o WebSocket de envio abre —
- * o sinal mais cedo possível de "frames estão chegando no backend agora".
- * Quem renderiza o <img> do /video_feed (CameraCard, ZoneEditor) usa isso pra
- * recarregar a imagem na hora, em vez de depender só do onError/retry: sem
- * isso, se o <img> tivesse sido montado ANTES desta câmera começar a mandar
- * frames (corrida comum logo ao abrir a página — pedir permissão de câmera
- * ao usuário não é instantâneo), o pedido de vídeo já teria estourado o
- * timeout do backend e fechado, e o navegador nunca tentaria de novo sozinho.
+ * `onEnviando` (opcional) é chamado no primeiro frame REALMENTE enviado — o
+ * sinal mais cedo possível de "o backend está recebendo dados agora". Quem
+ * renderiza o <img> do /video_feed (CameraCard, ZoneEditor) usa isso pra
+ * recarregar a imagem na hora, em vez de depender só do onError/retry.
  */
 export default function WebcamCapturePusher({ camera, onEnviando }) {
-  const [status, setStatus] = useState("conectando"); // conectando | enviando | erro
+  // conectando (pedindo câmera/abrindo WS) | aguardando (WS aberto, esperando
+  // o <video> ficar pronto pra capturar) | enviando (já mandou frame de
+  // verdade) | erro
+  const [status, setStatus] = useState("conectando");
   const [mensagemErro, setMensagemErro] = useState(null);
+  const videoRef = useRef(null);
 
   const ativo = camera && (camera.rtsp_url || "").trim().toLowerCase() === FONTE_WEBCAM_NAVEGADOR;
 
   useEffect(() => {
     if (!ativo) return undefined;
+    const video = videoRef.current; // capturado uma vez — evita ler .current de novo no cleanup (ref pode já ter mudado)
+    if (!video) return undefined;
 
     let cancelado = false;
     let mediaStream = null;
     let ws = null;
     let intervalo = null;
-    const video = document.createElement("video");
+    let jaEnviouAlgumFrame = false;
     const canvas = document.createElement("canvas");
     canvas.width = LARGURA;
     canvas.height = ALTURA;
@@ -55,7 +67,8 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
           video: { width: LARGURA, height: ALTURA },
           audio: false,
         });
-      } catch {
+      } catch (err) {
+        console.warn("[WebcamCapturePusher] getUserMedia falhou:", err);
         if (!cancelado) {
           setStatus("erro");
           setMensagemErro("Não foi possível acessar sua webcam (permissão negada ou nenhuma câmera encontrada).");
@@ -68,28 +81,25 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
       }
 
       video.srcObject = mediaStream;
-      video.muted = true;
-      video.playsInline = true;
       try {
         await video.play();
-      } catch {
-        // Alguns navegadores exigem interação do usuário pra autoplay — o
-        // elemento fica pronto mesmo assim assim que a página tiver o gesto.
+      } catch (err) {
+        // Alguns navegadores exigem um gesto do usuário pra autoplay — o
+        // elemento fica pronto mesmo assim assim que a página tiver o gesto;
+        // logamos pra facilitar diagnóstico se o vídeo nunca ficar pronto.
+        console.warn("[WebcamCapturePusher] video.play() rejeitado (pode ser normal, ver comentário):", err);
       }
+
+      setStatus("aguardando");
 
       ws = new WebSocket(getCameraIngestWsUrl(camera.id));
       ws.binaryType = "arraybuffer";
 
-      ws.onopen = () => {
-        if (!cancelado) {
-          setStatus("enviando");
-          onEnviando?.();
-        }
-      };
       ws.onclose = () => {
         if (!cancelado) setStatus("conectando");
       };
-      ws.onerror = () => {
+      ws.onerror = (err) => {
+        console.warn("[WebcamCapturePusher] erro no WebSocket:", err);
         if (!cancelado) {
           setStatus("erro");
           setMensagemErro("Falha na conexão com o backend para enviar sua webcam.");
@@ -97,15 +107,23 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
       };
 
       intervalo = setInterval(() => {
-        if (!ws || ws.readyState !== WebSocket.OPEN || video.readyState < 2) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (video.readyState < 2) return; // HAVE_CURRENT_DATA — ainda não há frame decodificado pra capturar
         ctx.drawImage(video, 0, 0, LARGURA, ALTURA);
         canvas.toBlob(
           (blob) => {
-            if (blob && ws && ws.readyState === WebSocket.OPEN) {
-              blob.arrayBuffer().then((buf) => {
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-              });
-            }
+            if (!blob || !ws || ws.readyState !== WebSocket.OPEN) return;
+            blob.arrayBuffer().then((buf) => {
+              if (!ws || ws.readyState !== WebSocket.OPEN) return;
+              ws.send(buf);
+              if (!jaEnviouAlgumFrame) {
+                jaEnviouAlgumFrame = true;
+                if (!cancelado) {
+                  setStatus("enviando");
+                  onEnviando?.();
+                }
+              }
+            });
           },
           "image/jpeg",
           QUALIDADE_JPEG
@@ -120,6 +138,7 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
       if (intervalo) clearInterval(intervalo);
       if (ws) ws.close();
       if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ativo, camera?.id]);
@@ -128,11 +147,22 @@ export default function WebcamCapturePusher({ camera, onEnviando }) {
 
   return (
     <div className="flex items-center gap-1.5 px-4 py-1.5 text-xs">
-      <span className={`size-1.5 rounded-full ${status === "enviando" ? "animate-pulse-live bg-emerald-400" : status === "erro" ? "bg-red-500" : "bg-amber-400"}`} />
+      {/* Precisa estar de verdade no DOM pra decodificar frames de forma confiável
+          entre navegadores (ver docstring acima) — por isso não é display:none,
+          só reduzido a 1px e sem impacto visual/de interação. */}
+      <video ref={videoRef} autoPlay muted playsInline aria-hidden="true" className="pointer-events-none absolute h-px w-px opacity-0" />
+
+      <span
+        className={`size-1.5 rounded-full ${
+          status === "enviando" ? "animate-pulse-live bg-emerald-400" : status === "erro" ? "bg-red-500" : "bg-amber-400"
+        }`}
+      />
       {status === "erro" ? (
         <span className="text-red-500">{mensagemErro}</span>
       ) : status === "enviando" ? (
         <span className="text-emerald-600 dark:text-emerald-400">Enviando sua webcam para o backend</span>
+      ) : status === "aguardando" ? (
+        <span className="text-neutral-500">Aguardando a webcam ficar pronta para captura…</span>
       ) : (
         <span className="text-neutral-500">Conectando à sua webcam…</span>
       )}
