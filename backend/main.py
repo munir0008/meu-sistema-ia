@@ -19,7 +19,17 @@ from vision import camera_manager
 # e sem handler, e o uvicorn não configura isso pra gente — só os próprios
 # loggers "uvicorn.*". Nível INFO aqui é o que faz os logs de diagnóstico do
 # fluxo de pagamento (Stripe) aparecerem no dashboard do Render.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+#
+# `%(process)d` no formato é deliberado: `camera_manager` (vision.py) é um
+# registry EM MEMÓRIA de UM processo — se o serviço no Render rodar mais de
+# uma instância, o WebSocket de ingest de uma câmera "browser" (que fica preso
+# na instância que aceitou a conexão) e as requisições HTTP de leitura
+# (/video_feed, /admin/cameras) podem cair em instâncias DIFERENTES, cada uma
+# com seu próprio VideoProcessor isolado pra mesma câmera — a que só recebe
+# nunca vê frame nenhum. Com o PID no log dá pra confirmar isso na hora: se
+# "camera_ingest conectado" e "primeiro frame entregue" aparecerem com PIDs
+# diferentes para a mesma câmera, é exatamente isso.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [pid=%(process)d] %(name)s: %(message)s")
 
 app = FastAPI(
     title="Plataforma SaaS de Inteligência Operacional por Câmeras",
