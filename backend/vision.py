@@ -966,6 +966,35 @@ class VideoProcessor:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, cor, 1, cv2.LINE_AA,
                 )
 
+    # -------------------- fallback seguro (LGPD) para falha de processamento --------------------
+    @staticmethod
+    def _frame_fallback_seguro(frame: np.ndarray) -> np.ndarray:
+        """
+        Usado quando `processar_frame` lança uma exceção (ver `_loop_processamento`)
+        — em vez de deixar o streaming de saída sem nenhum frame novo (o que, sem
+        esse fallback, faz o viewer nunca receber nada e a tela do usuário ficar
+        preta indefinidamente), serve uma versão pixelizada do frame INTEIRO.
+
+        Deliberadamente NÃO reaproveita `_anonimizar` (que só borra as caixas que o
+        YOLO detectou) — se a própria detecção/desenho de zonas foi o que lançou a
+        exceção, não há garantia de que `pessoas`/`boxes` estejam corretos ou
+        mesmo definidos nesse ponto. Pixelizar o frame INTEIRO (downscale agressivo
+        + upscale sem interpolação) não depende de nenhuma detecção ter funcionado
+        — continua 100% conforme LGPD (nenhum pixel reconhecível chega ao viewer)
+        mesmo no pior cenário de falha.
+        """
+        h, w = frame.shape[:2]
+        # Downscale bem agressivo (frame vira uma grade de ~20x15 "blocos") — o
+        # upscale de volta com INTER_NEAREST (sem suavização) é o que produz o
+        # efeito de pixelização, mais barato que um Gaussian blur num frame inteiro.
+        pequeno = cv2.resize(frame, (max(1, w // 32), max(1, h // 32)), interpolation=cv2.INTER_LINEAR)
+        pixelizado = cv2.resize(pequeno, (w, h), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(
+            pixelizado, "Processamento indisponivel no momento", (12, h - 16),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA,
+        )
+        return pixelizado
+
     # -------------------- pipeline por frame --------------------
     def processar_frame(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
@@ -1085,12 +1114,24 @@ class VideoProcessor:
                 processado = self.processar_frame(frame)
             except Exception:
                 # Uma falha pontual (ex.: frame corrompido) não pode derrubar a
-                # thread de processamento da câmera — só pula esse frame, mas loga
-                # com stack trace (antes era silencioso — uma falha recorrente aqui
-                # produzia exatamente o mesmo sintoma de "tela preta sem explicação"
-                # que a desconexão da câmera, sem nenhum log pra diferenciar as duas).
-                logger.exception("[camera %s] falha ao processar frame — pulando este frame.", self.camera_id)
-                continue
+                # thread de processamento da câmera — loga com stack trace completo
+                # (antes era silencioso — uma falha recorrente aqui produzia
+                # exatamente o mesmo sintoma de "tela preta sem explicação" que a
+                # desconexão da câmera, sem nenhum log pra diferenciar as duas) e
+                # tenta servir um frame de fallback SEGURO (pixelizado por inteiro,
+                # não depende de nenhuma detecção ter funcionado — ver docstring de
+                # `_frame_fallback_seguro`) em vez de deixar o buffer de saída sem
+                # nenhum frame novo. Só se ATÉ o fallback falhar (bem improvável,
+                # já que ele só faz resize) é que o frame é mesmo descartado.
+                logger.exception(
+                    "[camera %s] falha ao processar frame — servindo fallback pixelizado (LGPD-safe) neste frame.",
+                    self.camera_id,
+                )
+                try:
+                    processado = self._frame_fallback_seguro(frame)
+                except Exception:
+                    logger.exception("[camera %s] fallback de frame pixelizado TAMBÉM falhou — pulando este frame.", self.camera_id)
+                    continue
 
             ok, buffer = cv2.imencode(
                 ".jpg", processado, [int(cv2.IMWRITE_JPEG_QUALITY), config.STREAM_JPEG_QUALITY]
