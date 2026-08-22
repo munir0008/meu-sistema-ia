@@ -436,12 +436,35 @@ class VideoProcessor:
             pass
 
     # -------------------- detecção + rastreamento --------------------
+    def _carregar_modelo(self) -> None:
+        """
+        Carrega o YOLO desta câmera (import do ultralytics + pesos do disco) — em
+        CPU, especialmente em servidores com pouco CPU (ex.: instância free/starter
+        do Render), isso é lento: medimos localmente ~6s numa máquina razoável, e
+        já vimos relatos de bem mais que isso em produção. Chamada logo no início
+        de `_loop_processamento` (não mais só na primeira `_detectar_pessoas`) pra
+        acontecer EM PARALELO com a conexão da fonte de vídeo (CameraStream/
+        BrowserPushStream), em vez de serializado depois do primeiro frame chegar
+        — é essa serialização que fazia o carregamento do modelo comer o orçamento
+        de CAMERA_PRIMEIRO_FRAME_TIMEOUT_SEGUNDOS de generate_mjpeg() inteiro,
+        fechando o streaming ANTES do primeiro frame processado existir (o
+        sintoma: ingest via WebSocket "funcionando", mas o <img> de saída nunca
+        carrega — ver routes.camera_ingest vs. generate_mjpeg). Idempotente: seguro
+        chamar de novo (ex.: de dentro de `_detectar_pessoas`, como rede de
+        segurança) uma vez já carregado.
+        """
+        if self._modelo is not None:
+            return
+        inicio = time.monotonic()
+        logger.info("[camera %s] carregando modelo YOLO (%s)...", self.camera_id, config.YOLO_MODEL_PATH)
+        from ultralytics import YOLO
+
+        self._modelo = YOLO(config.YOLO_MODEL_PATH)
+        logger.info("[camera %s] modelo YOLO carregado em %.1fs.", self.camera_id, time.monotonic() - inicio)
+
     def _detectar_pessoas(self, frame: np.ndarray) -> List[Pessoa]:
         """Retorna lista de (classe=pessoa, track_id, (x1,y1,x2,y2)) usando o modelo desta câmera."""
-        if self._modelo is None:
-            from ultralytics import YOLO
-
-            self._modelo = YOLO(config.YOLO_MODEL_PATH)
+        self._carregar_modelo()  # normalmente já carregado — ver _loop_processamento
 
         resultados = self._modelo.track(
             frame,
@@ -1043,6 +1066,7 @@ class VideoProcessor:
         existem. É aqui — e não em `generate_mjpeg` — que a inferência de IA acontece,
         então requisições concorrentes da API nunca disputam o modelo desta câmera.
         """
+        self._carregar_modelo()  # eager, em paralelo com a conexão da fonte — ver docstring do método
         intervalo = 1.0 / max(1, config.STREAM_TARGET_FPS)
         while self._rodando:
             inicio = time.monotonic()
@@ -1110,6 +1134,11 @@ class VideoProcessor:
                 time.sleep(0.1)
                 continue
 
+            if not teve_frame:
+                logger.info(
+                    "[camera %s] primeiro frame entregue a um viewer após %.1fs de espera.",
+                    self.camera_id, time.monotonic() - inicio_espera,
+                )
             teve_frame = True
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
             time.sleep(intervalo)

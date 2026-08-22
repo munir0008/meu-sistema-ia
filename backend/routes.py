@@ -704,6 +704,7 @@ async def camera_ingest(websocket: WebSocket, camera_id: int):
 
     await websocket.accept()
     logger.info("[camera %s] navegador conectado em camera_ingest — recebendo frames.", camera_id)
+    frames_recebidos = 0
     try:
         while True:
             data = await websocket.receive_bytes()
@@ -711,10 +712,20 @@ async def camera_ingest(websocket: WebSocket, camera_id: int):
                 logger.warning("[camera %s] frame recebido (%d bytes) excede o limite — descartado.", camera_id, len(data))
                 continue
             frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                processador.stream.push_frame(frame)
+            if frame is None:
+                logger.warning("[camera %s] frame recebido (%d bytes) não pôde ser decodificado — descartado.", camera_id, len(data))
+                continue
+            processador.stream.push_frame(frame)
+            frames_recebidos += 1
+            if frames_recebidos == 1:
+                # Só o primeiro: a ~5fps um log por frame afogaria o resto do log.
+                # Sinaliza claramente "sim, o frame chegou e foi decodificado" —
+                # se isso aparece mas o vídeo não carrega, o problema está do lado
+                # do PROCESSAMENTO/entrega (ver logs de _carregar_modelo e
+                # generate_mjpeg), não da recepção.
+                logger.info("[camera %s] primeiro frame decodificado e entregue ao processador (shape=%s).", camera_id, frame.shape)
     except WebSocketDisconnect:
-        logger.info("[camera %s] navegador desconectou de camera_ingest.", camera_id)
+        logger.info("[camera %s] navegador desconectou de camera_ingest (recebeu %d frames).", camera_id, frames_recebidos)
 
 
 # ==============================================================================
